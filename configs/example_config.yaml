@@ -21,6 +21,8 @@ window:
 
 training:
   batch_size: 8
+  model:
+    variant: bilstm
   epochs: 10
   learning_rate: 0.001
   include_absolute_coordinates: false

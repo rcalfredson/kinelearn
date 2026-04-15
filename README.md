@@ -195,6 +195,7 @@ This YAML file defines:
   - training hyperparameters such as `epochs`, `batch_size`, `learning_rate`, and focal-loss settings
   - whether raw absolute keypoint coordinates are included in model input via `include_absolute_coordinates`
   - optional Gaussian noise injected into training windows via `keypoint_noise_std`, either globally or per behavior
+  - optional architecture selection via `training.model.variant` for either the original recurrent model or an opt-in convolutional front end
   - optional final zero-fill parity cleanup via `final_zero_fill`
 
 Example:
@@ -225,10 +226,25 @@ training:
     grooming: 0.0
     wing_extension: 0.01
     abdomen_bend: 0.0
+  model:
+    variant: bilstm
   final_zero_fill: false
 ```
 
 Set `training.keypoint_noise_std` to either a single float or a per-behavior mapping to add Gaussian noise to keypoint inputs during training only. A value of `0.01` matches the always-on noise used in the older training codepath; validation and test windows remain noise-free.
+Set `training.model.variant: bilstm` to use the original recurrent-only model, or `training.model.variant: conv_bilstm` to add a lightweight `Conv1D` front end before the BiLSTM stack. For `conv_bilstm`, you can optionally provide `training.model.conv_frontend.filters` and `training.model.conv_frontend.kernel_sizes`; the defaults are `[32, 32]` and `[5, 3]`.
+
+For behaviors that may depend on short local motion motifs, you can opt into a convolutional front end in the config:
+
+```yaml
+training:
+  model:
+    variant: conv_bilstm
+    conv_frontend:
+      filters: [32, 32]
+      kernel_sizes: [5, 3]
+```
+
 Set `training.final_zero_fill: true` to apply one final `fillna(0)` pass after loading the per-video feature files and before windowing, which mirrors the old validation/training pipeline's last-stage NaN cleanup.
 
 ---

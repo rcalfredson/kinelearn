@@ -30,7 +30,7 @@ import yaml
 from KineLearn.core.generators import KeypointWindowGenerator
 from KineLearn.core.losses import focal_loss
 from KineLearn.core.memmap import make_windowed_memmaps
-from KineLearn.core.models import build_keypoint_bilstm
+from KineLearn.core.models import build_sequence_model
 
 # (Optional for future training step)
 try:
@@ -476,6 +476,8 @@ def main():
     training_cfg.setdefault("early_stopping_patience", 3)
     training_cfg.setdefault("early_stopping_min_delta", 0.0)
     training_cfg.setdefault("keypoint_noise_std", 0.0)
+    training_cfg.setdefault("model", {})
+    training_cfg["model"].setdefault("variant", "bilstm")
     training_cfg.setdefault("final_zero_fill", False)
 
     # Resolve focal params (alpha can be global or per-behavior)
@@ -503,6 +505,7 @@ def main():
         print(f"  focal.alpha({behavior}): {alpha}")
         print(f"  focal.gamma: {gamma}")
     print(f"  keypoint_noise_std({behavior}): {noise_std}")
+    print(f"  model.variant: {training_cfg['model']['variant']}")
 
     features_dir = Path(args.features_dir)
     known_stems = available_feature_stems(features_dir)
@@ -884,7 +887,7 @@ def main():
     # ----------------------------
     # Model + compile
     # ----------------------------
-    model = build_keypoint_bilstm(wsize, derived_dim)
+    model = build_sequence_model(wsize, derived_dim, model_cfg=training_cfg.get("model"))
 
     lr = float(training_cfg["learning_rate"])
     if training_cfg.get("loss", "focal") != "focal":

@@ -49,6 +49,13 @@ window:
 
 training:
   batch_size: 8
+  model:
+    variant: bilstm
+    # Optional front-end for subtle temporal motifs:
+    # variant: conv_bilstm
+    # conv_frontend:
+    #   filters: [32, 32]
+    #   kernel_sizes: [5, 3]
   epochs: 10
   learning_rate: 0.001
   include_absolute_coordinates: false
