@@ -208,6 +208,7 @@ __marimo__/
 
 # Editor
 .vscode
+.codex
 
 # Project
 configs/*
