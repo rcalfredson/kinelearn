@@ -610,12 +610,14 @@ kinelearn-batch-eval-splits \
 ```
 
 Optional CLI arguments:
+- `--manifest` to score a fixed source, such as an ensemble manifest, across every run in the sweep
 - `--subset train|val|test` to choose which subset to evaluate for each run (default: `val`)
 - `--threshold` to change the frame-level decision threshold passed through to `kinelearn-eval`
 - `--level frame|episode|both` to request frame-level metrics, episode-level metrics, or both
 - `--episode-min-frames` to control the minimum predicted episode length
 - `--episode-max-gap` to control the allowed internal gap inside a predicted episode
 - `--episode-overlap-threshold` to control predicted/ground-truth episode matching
+- `--ensemble-recusal-policy none|train|train_val` to control abstention when evaluating ensemble sources (default: `train_val`)
 - `--batch-size` to override evaluation batch size
 - `--out-dir` to choose the output directory
 
@@ -628,18 +630,20 @@ Practical notes:
 - If a sweep already recorded `manifest_path` values, the command uses them directly.
 - If manifests are missing from the sweep table, the command attempts to infer them by matching `split_path` and `val_split_path`.
 - Failed or unresolved runs are kept in the summary CSV with an error field instead of being silently dropped.
+- When one or more `--manifest` values are provided, `kinelearn-batch-eval-splits` evaluates those fixed source manifests against each run's resolved train manifest via `kinelearn-eval --eval-manifest`.
 
 ---
 ## 📊 Evaluating Predictions
 
-The `kinelearn-eval` command evaluates one or more trained single-behavior models from their `train_manifest.yml` files.
+The `kinelearn-eval` command evaluates one or more trained single-behavior sources from saved manifests.
 
 It performs:
-1. **Loading manifests and weights** — reads one or more training manifests and resolves the saved model weights for each behavior.
-2. **Loading windowed artifacts** — opens the chosen subset's memmaps and index arrays from the training run directory.
+1. **Loading manifests and weights** — reads one or more train or ensemble manifests and resolves the saved model weights for each behavior source.
+2. **Loading windowed artifacts** — opens the chosen subset's memmaps and index arrays from either each source manifest directly or from `--eval-manifest` when scoring a fixed source against a historical split run.
 3. **Reconstructing frame-level predictions** — runs inference over windows and averages overlapping window probabilities back onto frames.
-4. **Computing metrics** — reports frame-level metrics, episode-level metrics, or both, depending on the selected evaluation mode.
-5. **Saving evaluation outputs** — writes an evaluation summary, per-behavior metrics table, frame-level predictions table, and episode error table when episode-level reporting is enabled.
+4. **Applying optional ensemble recusal** — for ensemble sources evaluated with `--eval-manifest`, members can abstain on stems they saw during training and/or validation.
+5. **Computing metrics** — reports frame-level metrics, episode-level metrics, or both, depending on the selected evaluation mode.
+6. **Saving evaluation outputs** — writes an evaluation summary, per-behavior metrics table, frame-level predictions table, and episode error table when episode-level reporting is enabled.
 
 ### Example commands
 
@@ -668,10 +672,22 @@ kinelearn-eval \
   --level both
 ```
 
+Recusal-aware ensemble evaluation on a historical split run:
+
+```bash
+kinelearn-eval \
+  --manifest results/ensembles/genitalia_extension/ge_split_variability_mean/ensemble_manifest.yml \
+  --eval-manifest results/genitalia_extension/20260328_150135/train_manifest.yml \
+  --subset test \
+  --ensemble-recusal-policy train_val
+```
+
 Optional CLI arguments:
 - `--subset train|val|test` to choose which split to evaluate (default: `test`)
 - `--threshold` to change the frame-level decision threshold (default: `0.5`)
 - `--level frame|episode|both` to switch between frame-level and episode-level reporting
+- `--eval-manifest` to evaluate a fixed source, such as an ensemble manifest, against the subset artifacts recorded in a specific training run
+- `--ensemble-recusal-policy none|train|train_val` to control abstention during ensemble evaluation with `--eval-manifest` (default: `train_val`)
 - `--episode-min-frames` to control the minimum predicted episode length (default: `16`)
 - `--episode-max-gap` to control the allowed internal gap inside a predicted episode (default: `3`)
 - `--episode-overlap-threshold` to control predicted/ground-truth episode matching (default: `0.2`)
@@ -687,7 +703,9 @@ This will write:
 Current scope notes:
 - Episode-level reporting uses thresholded frame predictions to build bouts with a minimum length and a small allowed internal gap.
 - For multi-model evaluation, provide at most one manifest per behavior.
-- Manifests in the same evaluation run must share the same project/split/window settings.
+- Without `--eval-manifest`, `kinelearn-eval` preserves the original behavior and expects ordinary train manifests.
+- With `--eval-manifest`, prediction sources must match the evaluation manifest's inference signature, while ensemble members may come from different split runs.
+- Per-behavior metrics include frame/video coverage so recusal-aware ensemble scores remain interpretable.
 
 ## 🧮 Creating Ensembles
 
@@ -699,7 +717,7 @@ This first implementation is intentionally narrow:
 - Ensembles are behavior-specific.
 - Members must be compatible for inference: same behavior, feature columns, window settings, feature-selection signature, and inference-relevant preprocessing.
 - Aggregation is mean probability only.
-- Ensemble manifests are for inference today; `kinelearn-eval` still expects train manifests.
+- Ensemble manifests work for both inference and recusal-aware evaluation.
 
 Example command:
 
@@ -731,7 +749,7 @@ The first implementation is intentionally simple:
 - Inputs can mix one or more split-variability sweep outputs and direct `train_manifest.yml` paths.
 - All candidates must match in behavior, feature/window signature, and training recipe; split metadata may differ.
 - Candidates are scored on the validation subset only.
-- Selection keeps runs within a configurable score band of the best validation performer, then lightly prefers diversity across outer splits when that provenance exists.
+- Selection can either keep a configurable score band of the best validation performer with a light outer-split diversity preference, or use strict top-N ranking by score.
 - The result is a normal `ensemble_manifest.yml`, so it stays compatible with the current ensemble inference flow.
 
 Example command:
@@ -743,10 +761,23 @@ kinelearn-select-ensemble \
   --metric frame_f1 \
   --threshold 0.6 \
   --min-score 0.55 \
+  --selection-mode band_diverse \
   --band-tolerance 0.03 \
   --max-members 5 \
   --name ge_validation_band \
   --out-dir results/ensembles/genitalia_extension/ge_validation_band
+```
+
+Strict top-5 example:
+
+```bash
+kinelearn-select-ensemble \
+  --source results/split_variability/ge_nested \
+  --metric frame_f1 \
+  --selection-mode top_n \
+  --max-members 5 \
+  --name ge_top5 \
+  --out-dir results/ensembles/genitalia_extension/ge_top5
 ```
 
 This writes:
@@ -758,6 +789,8 @@ Practical notes:
 - `--source` accepts a split-variability directory, `results_summary.csv`, or `experiment_plan.csv`.
 - `--manifest` can be used to add hand-picked direct runs into the candidate pool.
 - Use validation metrics for selection; keep test-set reporting separate.
+- `--selection-mode band_diverse` is the default and uses `--band-tolerance`; `--selection-mode top_n` ignores the band and uses strict score ordering.
+- Leave `--max-members` unset to keep all candidates that survive the active selection filters.
 - The current scoring metrics are `frame_f1`, `frame_precision`, `frame_recall`, `episode_f1`, `episode_precision`, and `episode_recall`.
 - For archived runs whose memmaps were pruned during archiving, restore the run artifacts first with `kinelearn-restore-run-artifacts`.
 

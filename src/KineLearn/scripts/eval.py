@@ -16,12 +16,14 @@ import pandas as pd
 import yaml
 
 from KineLearn.core.manifests import (
+    load_prediction_source,
     load_train_manifest,
+    recusal_stems,
     resolve_recorded_path,
     resolve_weights_path,
     validate_train_manifests,
 )
-from KineLearn.core.models import build_keypoint_bilstm
+from KineLearn.core.models import build_sequence_model
 
 try:
     import tensorflow as tf
@@ -58,9 +60,50 @@ def build_loaded_model(manifest: dict, weights_path: Path) -> "tf.keras.Model":
         raise ImportError("TensorFlow is required for evaluation.")
     window_size = int(manifest["window"]["size"])
     input_dim = int(manifest["feature_selection"]["n_input_features"])
-    model = build_keypoint_bilstm(window_size, input_dim)
+    model = build_sequence_model(
+        window_size,
+        input_dim,
+        model_cfg=(manifest.get("training") or {}).get("model"),
+    )
     model.load_weights(str(weights_path))
     return model
+
+
+def validate_prediction_sources_against_eval_manifest(
+    prediction_sources: list[dict[str, Any]],
+    eval_manifest: dict[str, Any],
+) -> None:
+    if not prediction_sources:
+        raise ValueError("At least one prediction source is required.")
+
+    behaviors = [source["behavior"] for source in prediction_sources]
+    dupes = sorted({b for b in behaviors if behaviors.count(b) > 1})
+    if dupes:
+        raise ValueError(f"Duplicate behaviors in evaluation set: {dupes}")
+
+    eval_training = eval_manifest.get("training") or {}
+    eval_signature = {
+        "kl_config": eval_manifest.get("kl_config"),
+        "label_columns": list(eval_manifest["label_columns"]),
+        "feature_columns": list(eval_manifest["feature_columns"]),
+        "window": dict(eval_manifest["window"]),
+        "feature_selection": dict(eval_manifest["feature_selection"]),
+        "final_zero_fill": bool(eval_training.get("final_zero_fill", False)),
+    }
+    for source in prediction_sources:
+        source_signature = {
+            "kl_config": source.get("kl_config"),
+            "label_columns": list(source["label_columns"]),
+            "feature_columns": list(source["feature_columns"]),
+            "window": dict(source["window"]),
+            "feature_selection": dict(source["feature_selection"]),
+            "final_zero_fill": bool((source.get("training") or {}).get("final_zero_fill", False)),
+        }
+        if source_signature != eval_signature:
+            raise ValueError(
+                f"Prediction source for behavior '{source['behavior']}' is incompatible "
+                "with the evaluation manifest."
+            )
 
 
 def prepare_frame_buffers(
@@ -81,9 +124,8 @@ def prepare_frame_buffers(
     return buffers
 
 
-def aggregate_predictions(
-    model: "tf.keras.Model",
-    mmX: np.memmap,
+def populate_true_labels(
+    buffers: dict[str, dict[str, np.ndarray]],
     mmY: np.memmap,
     vids: np.ndarray,
     starts: np.ndarray,
@@ -91,28 +133,49 @@ def aggregate_predictions(
     behavior_idx: int,
     window_size: int,
     batch_size: int,
-) -> dict[str, dict[str, np.ndarray]]:
-    buffers = prepare_frame_buffers(vids, starts, window_size)
+) -> None:
+    n = int(mmY.shape[0])
+
+    for start_idx in range(0, n, batch_size):
+        end_idx = min(start_idx + batch_size, n)
+        yb = np.asarray(mmY[start_idx:end_idx, :, behavior_idx], dtype=np.uint8)
+        for local_idx, global_idx in enumerate(range(start_idx, end_idx)):
+            stem = str(vids[global_idx])
+            frame_start = int(starts[global_idx])
+            frame_end = frame_start + window_size
+            buffers[stem]["true"][frame_start:frame_end] = np.maximum(
+                buffers[stem]["true"][frame_start:frame_end], yb[local_idx]
+            )
+
+
+def aggregate_member_predictions(
+    model: "tf.keras.Model",
+    mmX: np.memmap,
+    vids: np.ndarray,
+    starts: np.ndarray,
+    buffers: dict[str, dict[str, np.ndarray]],
+    *,
+    window_size: int,
+    batch_size: int,
+    excluded_stems: set[str] | None = None,
+) -> None:
+    excluded_stems = excluded_stems or set()
     n = int(mmX.shape[0])
 
     for start_idx in range(0, n, batch_size):
         end_idx = min(start_idx + batch_size, n)
         Xb = np.asarray(mmX[start_idx:end_idx], dtype=np.float32)
-        yb = np.asarray(mmY[start_idx:end_idx, :, behavior_idx], dtype=np.uint8)
         pred = np.asarray(model.predict_on_batch(Xb), dtype=np.float32)[..., 0]
 
         for local_idx, global_idx in enumerate(range(start_idx, end_idx)):
             stem = str(vids[global_idx])
+            if stem in excluded_stems:
+                continue
             frame_start = int(starts[global_idx])
             frame_end = frame_start + window_size
             buf = buffers[stem]
             buf["prob_sum"][frame_start:frame_end] += pred[local_idx]
             buf["count"][frame_start:frame_end] += 1
-            buf["true"][frame_start:frame_end] = np.maximum(
-                buf["true"][frame_start:frame_end], yb[local_idx]
-            )
-
-    return buffers
 
 
 def frame_table_from_buffers(
@@ -146,6 +209,23 @@ def frame_table_from_buffers(
     if not parts:
         raise ValueError(f"No frame predictions were reconstructed for behavior '{behavior}'.")
     return pd.concat(parts, ignore_index=True)
+
+
+def coverage_summary_from_buffers(
+    buffers: dict[str, dict[str, np.ndarray]],
+) -> dict[str, Any]:
+    total_frames = int(sum(len(buf["true"]) for buf in buffers.values()))
+    scored_frames = int(sum(np.count_nonzero(buf["count"] > 0) for buf in buffers.values()))
+    total_videos = int(len(buffers))
+    scored_videos = int(sum(bool(np.any(buf["count"] > 0)) for buf in buffers.values()))
+    return {
+        "n_total_frames": total_frames,
+        "n_scored_frames": scored_frames,
+        "frame_coverage": float(scored_frames / total_frames) if total_frames else 0.0,
+        "n_total_videos": total_videos,
+        "n_scored_videos": scored_videos,
+        "n_fully_recused_videos": int(total_videos - scored_videos),
+    }
 
 
 def compute_binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
@@ -380,9 +460,9 @@ def evaluate_manifest(
     mmX, mmY, vids, starts = load_subset_arrays(manifest, manifest_path, subset)
 
     eval_batch_size = batch_size or int(manifest.get("training", {}).get("batch_size", 8))
-    buffers = aggregate_predictions(
-        model,
-        mmX,
+    buffers = prepare_frame_buffers(vids, starts, window_size)
+    populate_true_labels(
+        buffers,
         mmY,
         vids,
         starts,
@@ -390,7 +470,17 @@ def evaluate_manifest(
         window_size=window_size,
         batch_size=eval_batch_size,
     )
+    aggregate_member_predictions(
+        model,
+        mmX,
+        vids,
+        starts,
+        buffers,
+        window_size=window_size,
+        batch_size=eval_batch_size,
+    )
     frame_df = frame_table_from_buffers(buffers, behavior=behavior, threshold=threshold)
+    coverage = coverage_summary_from_buffers(buffers)
     metric_rows = []
     error_rows: list[dict[str, Any]] = []
 
@@ -409,6 +499,10 @@ def evaluate_manifest(
                 "n_positive_frames": int(frame_df[f"true_{behavior}"].sum()),
                 "manifest_path": str(manifest_path.resolve()),
                 "weights_path": str(weights_path.resolve()),
+                "manifest_kind": "train",
+                "recusal_policy": "none",
+                "ensemble_n_members": 1,
+                **coverage,
             }
         )
         metric_rows.append(frame_metrics)
@@ -432,6 +526,125 @@ def evaluate_manifest(
                 "episode_overlap_threshold": float(episode_overlap_threshold),
                 "manifest_path": str(manifest_path.resolve()),
                 "weights_path": str(weights_path.resolve()),
+                "manifest_kind": "train",
+                "recusal_policy": "none",
+                "ensemble_n_members": 1,
+                **coverage,
+            }
+        )
+        metric_rows.append(episode_metrics)
+        error_rows.extend(episode_errors)
+
+    return frame_df, metric_rows, error_rows
+
+
+def evaluate_prediction_source(
+    source: dict[str, Any],
+    eval_manifest: dict,
+    eval_manifest_path: Path,
+    *,
+    subset: str,
+    threshold: float,
+    batch_size: int | None,
+    level: str,
+    episode_min_frames: int,
+    episode_max_gap: int,
+    episode_overlap_threshold: float,
+    ensemble_recusal_policy: str,
+) -> tuple[pd.DataFrame, list[dict[str, Any]], list[dict[str, Any]]]:
+    behavior = source["behavior"]
+    behavior_idx = int(source["behavior_idx"])
+    window_size = int(source["window"]["size"])
+    mmX, mmY, vids, starts = load_subset_arrays(eval_manifest, eval_manifest_path, subset)
+
+    eval_batch_size = batch_size or int(eval_manifest.get("training", {}).get("batch_size", 8))
+    buffers = prepare_frame_buffers(vids, starts, window_size)
+    populate_true_labels(
+        buffers,
+        mmY,
+        vids,
+        starts,
+        behavior_idx=behavior_idx,
+        window_size=window_size,
+        batch_size=eval_batch_size,
+    )
+
+    for member in source["members"]:
+        excluded_stems: set[str] = set()
+        if source["manifest_kind"] == "ensemble" and ensemble_recusal_policy != "none":
+            excluded_stems = recusal_stems(
+                member["manifest"],
+                policy=ensemble_recusal_policy,
+            )
+        model = build_loaded_model(member["manifest"], member["weights_path"])
+        aggregate_member_predictions(
+            model,
+            mmX,
+            vids,
+            starts,
+            buffers,
+            window_size=window_size,
+            batch_size=eval_batch_size,
+            excluded_stems=excluded_stems,
+        )
+
+    frame_df = frame_table_from_buffers(buffers, behavior=behavior, threshold=threshold)
+    coverage = coverage_summary_from_buffers(buffers)
+    metric_rows = []
+    error_rows: list[dict[str, Any]] = []
+
+    if level in {"frame", "both"}:
+        frame_metrics = compute_binary_metrics(
+            frame_df[f"true_{behavior}"].to_numpy(),
+            frame_df[f"pred_{behavior}"].to_numpy(),
+        )
+        frame_metrics.update(
+            {
+                "behavior": behavior,
+                "subset": subset,
+                "level": "frame",
+                "threshold": float(threshold),
+                "n_frames": int(len(frame_df)),
+                "n_positive_frames": int(frame_df[f"true_{behavior}"].sum()),
+                "manifest_path": str(source["manifest_path"]),
+                "weights_path": None,
+                "manifest_kind": str(source["manifest_kind"]),
+                "evaluation_manifest_path": str(eval_manifest_path.resolve()),
+                "recusal_policy": (
+                    ensemble_recusal_policy if source["manifest_kind"] == "ensemble" else "none"
+                ),
+                "ensemble_n_members": int(source["aggregation"]["n_members"]),
+                **coverage,
+            }
+        )
+        metric_rows.append(frame_metrics)
+
+    if level in {"episode", "both"}:
+        episode_metrics, episode_errors = compute_episode_outputs(
+            frame_df,
+            behavior=behavior,
+            min_pred_frames=episode_min_frames,
+            max_gap=episode_max_gap,
+            overlap_threshold=episode_overlap_threshold,
+        )
+        episode_metrics.update(
+            {
+                "behavior": behavior,
+                "subset": subset,
+                "level": "episode",
+                "threshold": float(threshold),
+                "episode_min_frames": int(episode_min_frames),
+                "episode_max_gap": int(episode_max_gap),
+                "episode_overlap_threshold": float(episode_overlap_threshold),
+                "manifest_path": str(source["manifest_path"]),
+                "weights_path": None,
+                "manifest_kind": str(source["manifest_kind"]),
+                "evaluation_manifest_path": str(eval_manifest_path.resolve()),
+                "recusal_policy": (
+                    ensemble_recusal_policy if source["manifest_kind"] == "ensemble" else "none"
+                ),
+                "ensemble_n_members": int(source["aggregation"]["n_members"]),
+                **coverage,
             }
         )
         metric_rows.append(episode_metrics)
@@ -449,10 +662,11 @@ def merge_behavior_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def build_summary(
-    manifests: list[dict],
-    manifest_paths: list[Path],
-    metrics_rows: list[dict[str, Any]],
     *,
+    source_paths: list[Path],
+    metrics_rows: list[dict[str, Any]],
+    eval_manifest: dict | None,
+    eval_manifest_path: Path | None,
     subset: str,
     level: str,
     threshold: float,
@@ -475,9 +689,12 @@ def build_summary(
             "overlap_threshold": float(episode_overlap_threshold),
         },
         "out_dir": str(out_dir.resolve()),
-        "kl_config": manifests[0]["kl_config"],
-        "split": manifests[0]["split"],
-        "manifests": [str(path.resolve()) for path in manifest_paths],
+        "kl_config": eval_manifest.get("kl_config") if eval_manifest is not None else None,
+        "split": eval_manifest.get("split") if eval_manifest is not None else None,
+        "manifests": [str(path.resolve()) for path in source_paths],
+        "evaluation_manifest": (
+            str(eval_manifest_path.resolve()) if eval_manifest_path is not None else None
+        ),
         "behaviors": sorted({row["behavior"] for row in metrics_rows}),
         "frame_level_metrics": (
             {
@@ -515,7 +732,27 @@ def main():
         "--manifest",
         action="append",
         required=True,
-        help="Path to a train_manifest.yml file. Provide once per behavior model.",
+        help=(
+            "Path to a train_manifest.yml or ensemble_manifest.yml file. "
+            "Provide once per behavior source."
+        ),
+    )
+    parser.add_argument(
+        "--eval-manifest",
+        default=None,
+        help=(
+            "Optional train_manifest.yml whose subset artifacts define the evaluation "
+            "dataset and labels."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-recusal-policy",
+        choices=["none", "train", "train_val"],
+        default="train_val",
+        help=(
+            "Which member-owned stems should cause abstention during ensemble evaluation "
+            "(default: train_val). Applies only to ensemble sources."
+        ),
     )
     parser.add_argument(
         "--subset",
@@ -577,9 +814,8 @@ def main():
     if args.episode_max_gap < 0:
         raise ValueError("--episode-max-gap must be non-negative.")
 
-    manifest_paths = [Path(p) for p in args.manifest]
-    manifests = [load_train_manifest(path) for path in manifest_paths]
-    validate_train_manifests(manifests, args.subset)
+    source_paths = [Path(p) for p in args.manifest]
+    eval_manifest_path = Path(args.eval_manifest) if args.eval_manifest else None
 
     out_dir = Path(args.out) if args.out else default_out_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -587,35 +823,74 @@ def main():
     frame_tables = []
     metrics_rows = []
     error_rows = []
-    for manifest, manifest_path in zip(manifests, manifest_paths):
-        frame_df, manifest_metrics, manifest_errors = evaluate_manifest(
-            manifest,
-            manifest_path,
-            subset=args.subset,
-            threshold=float(args.threshold),
-            batch_size=args.batch_size,
-            level=args.level,
-            episode_min_frames=args.episode_min_frames,
-            episode_max_gap=args.episode_max_gap,
-            episode_overlap_threshold=float(args.episode_overlap_threshold),
-        )
-        frame_tables.append(frame_df)
-        metrics_rows.extend(manifest_metrics)
-        error_rows.extend(manifest_errors)
-        for metrics in manifest_metrics:
-            print(
-                f"[{metrics['behavior']}:{metrics['level']}] "
-                f"precision={metrics['precision']:.4f} "
-                f"recall={metrics['recall']:.4f} f1={metrics['f1']:.4f}"
+    if eval_manifest_path is None:
+        manifest_paths = source_paths
+        manifests = [load_train_manifest(path) for path in manifest_paths]
+        validate_train_manifests(manifests, args.subset)
+
+        for manifest, manifest_path in zip(manifests, manifest_paths):
+            frame_df, manifest_metrics, manifest_errors = evaluate_manifest(
+                manifest,
+                manifest_path,
+                subset=args.subset,
+                threshold=float(args.threshold),
+                batch_size=args.batch_size,
+                level=args.level,
+                episode_min_frames=args.episode_min_frames,
+                episode_max_gap=args.episode_max_gap,
+                episode_overlap_threshold=float(args.episode_overlap_threshold),
             )
+            frame_tables.append(frame_df)
+            metrics_rows.extend(manifest_metrics)
+            error_rows.extend(manifest_errors)
+            for metrics in manifest_metrics:
+                print(
+                    f"[{metrics['behavior']}:{metrics['level']}] "
+                    f"precision={metrics['precision']:.4f} "
+                    f"recall={metrics['recall']:.4f} f1={metrics['f1']:.4f}"
+                )
+        summary_eval_manifest = manifests[0]
+        summary_eval_manifest_path = None
+    else:
+        eval_manifest = load_train_manifest(eval_manifest_path)
+        prediction_sources = [load_prediction_source(path) for path in source_paths]
+        validate_prediction_sources_against_eval_manifest(prediction_sources, eval_manifest)
+
+        for source in prediction_sources:
+            frame_df, source_metrics, source_errors = evaluate_prediction_source(
+                source,
+                eval_manifest,
+                eval_manifest_path,
+                subset=args.subset,
+                threshold=float(args.threshold),
+                batch_size=args.batch_size,
+                level=args.level,
+                episode_min_frames=args.episode_min_frames,
+                episode_max_gap=args.episode_max_gap,
+                episode_overlap_threshold=float(args.episode_overlap_threshold),
+                ensemble_recusal_policy=args.ensemble_recusal_policy,
+            )
+            frame_tables.append(frame_df)
+            metrics_rows.extend(source_metrics)
+            error_rows.extend(source_errors)
+            for metrics in source_metrics:
+                print(
+                    f"[{metrics['behavior']}:{metrics['level']}] "
+                    f"precision={metrics['precision']:.4f} "
+                    f"recall={metrics['recall']:.4f} f1={metrics['f1']:.4f} "
+                    f"(coverage={metrics['frame_coverage']:.4f})"
+                )
+        summary_eval_manifest = eval_manifest
+        summary_eval_manifest_path = eval_manifest_path
 
     merged_frames = merge_behavior_frames(frame_tables)
     metrics_df = pd.DataFrame(metrics_rows)
     errors_df = pd.DataFrame(error_rows)
     summary = build_summary(
-        manifests,
-        manifest_paths,
-        metrics_rows,
+        source_paths=source_paths,
+        metrics_rows=metrics_rows,
+        eval_manifest=summary_eval_manifest,
+        eval_manifest_path=summary_eval_manifest_path,
         subset=args.subset,
         level=args.level,
         threshold=float(args.threshold),

@@ -116,6 +116,7 @@ class SelectEnsembleTests(unittest.TestCase):
 
         selected, excluded, summary = select_candidate_rows(
             rows,
+            selection_mode="band_diverse",
             min_score=None,
             band_tolerance=0.03,
             max_members=2,
@@ -124,6 +125,50 @@ class SelectEnsembleTests(unittest.TestCase):
         self.assertEqual([row["manifest_path"] for row in selected], [Path("/tmp/a.yml"), Path("/tmp/c.yml")])
         self.assertEqual([row["manifest_path"] for row in excluded], [Path("/tmp/b.yml")])
         self.assertEqual(summary["n_in_band"], 3)
+        self.assertEqual(summary["selection_mode"], "band_diverse")
+
+    def test_select_candidate_rows_top_n_uses_strict_score_order(self) -> None:
+        rows = [
+            {"manifest_path": Path("/tmp/a.yml"), "score": 0.90, "outer_id": "outer_a"},
+            {"manifest_path": Path("/tmp/b.yml"), "score": 0.89, "outer_id": "outer_a"},
+            {"manifest_path": Path("/tmp/c.yml"), "score": 0.88, "outer_id": "outer_b"},
+        ]
+
+        selected, excluded, summary = select_candidate_rows(
+            rows,
+            selection_mode="top_n",
+            min_score=None,
+            band_tolerance=0.03,
+            max_members=2,
+        )
+
+        self.assertEqual([row["manifest_path"] for row in selected], [Path("/tmp/a.yml"), Path("/tmp/b.yml")])
+        self.assertEqual([row["manifest_path"] for row in excluded], [Path("/tmp/c.yml")])
+        self.assertIsNone(summary["band_floor"])
+        self.assertIsNone(summary["n_in_band"])
+        self.assertEqual(summary["selection_mode"], "top_n")
+
+    def test_select_candidate_rows_without_cap_keeps_all_band_members(self) -> None:
+        rows = [
+            {"manifest_path": Path("/tmp/a.yml"), "score": 0.90, "outer_id": "outer_a"},
+            {"manifest_path": Path("/tmp/b.yml"), "score": 0.89, "outer_id": "outer_a"},
+            {"manifest_path": Path("/tmp/c.yml"), "score": 0.88, "outer_id": "outer_b"},
+        ]
+
+        selected, excluded, summary = select_candidate_rows(
+            rows,
+            selection_mode="band_diverse",
+            min_score=None,
+            band_tolerance=0.03,
+            max_members=None,
+        )
+
+        self.assertEqual(
+            [row["manifest_path"] for row in selected],
+            [Path("/tmp/a.yml"), Path("/tmp/b.yml"), Path("/tmp/c.yml")],
+        )
+        self.assertEqual(excluded, [])
+        self.assertEqual(summary["n_selected"], 3)
 
     def test_select_ensemble_cli_writes_manifest_and_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -193,6 +238,8 @@ class SelectEnsembleTests(unittest.TestCase):
                 str(manifest_c),
                 "--name",
                 "ge_selected",
+                "--selection-mode",
+                "band_diverse",
                 "--max-members",
                 "2",
                 "--band-tolerance",
@@ -221,6 +268,7 @@ class SelectEnsembleTests(unittest.TestCase):
 
             summary = yaml.safe_load(summary_path.read_text())
             self.assertEqual(summary["metric"], "frame_f1")
+            self.assertEqual(summary["selection_mode"], "band_diverse")
             self.assertEqual(len(summary["selected_members"]), 2)
 
 

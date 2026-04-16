@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--manifest",
+        action="append",
+        default=[],
+        help=(
+            "Optional evaluation source manifest(s). When omitted, each run evaluates its own "
+            "train_manifest.yml. When provided, those source manifests are evaluated against "
+            "each run via --eval-manifest."
+        ),
+    )
+    parser.add_argument(
         "--eval-command",
         default="kinelearn-eval",
         help="Evaluation executable to invoke (default: kinelearn-eval).",
@@ -87,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional evaluation batch size override.",
+    )
+    parser.add_argument(
+        "--ensemble-recusal-policy",
+        choices=["none", "train", "train_val"],
+        default="train_val",
+        help="Recusal policy to pass through for ensemble evaluation (default: train_val).",
     )
     parser.add_argument(
         "--out-dir",
@@ -194,25 +210,32 @@ def build_eval_command(
     manifest_path: Path,
     out_dir: Path,
 ) -> list[str]:
-    command = [
-        args.eval_command,
-        "--manifest",
-        str(manifest_path),
-        "--subset",
-        args.subset,
-        "--threshold",
-        str(args.threshold),
-        "--level",
-        args.level,
-        "--episode-min-frames",
-        str(args.episode_min_frames),
-        "--episode-max-gap",
-        str(args.episode_max_gap),
-        "--episode-overlap-threshold",
-        str(args.episode_overlap_threshold),
-        "--out",
-        str(out_dir),
-    ]
+    command = [args.eval_command]
+    if args.manifest:
+        for source_manifest in args.manifest:
+            command.extend(["--manifest", str(Path(source_manifest).resolve())])
+        command.extend(["--eval-manifest", str(manifest_path.resolve())])
+        command.extend(["--ensemble-recusal-policy", args.ensemble_recusal_policy])
+    else:
+        command.extend(["--manifest", str(manifest_path.resolve())])
+    command.extend(
+        [
+            "--subset",
+            args.subset,
+            "--threshold",
+            str(args.threshold),
+            "--level",
+            args.level,
+            "--episode-min-frames",
+            str(args.episode_min_frames),
+            "--episode-max-gap",
+            str(args.episode_max_gap),
+            "--episode-overlap-threshold",
+            str(args.episode_overlap_threshold),
+            "--out",
+            str(out_dir),
+        ]
+    )
     if args.batch_size is not None:
         command.extend(["--batch-size", str(args.batch_size)])
     return command
@@ -246,9 +269,11 @@ def main() -> None:
             "source": str(source.resolve()),
             "sweep_dir": str(sweep_dir.resolve()),
             "table_path": str(table_path.resolve()),
+            "manifests": [str(Path(p).resolve()) for p in args.manifest],
             "subset": args.subset,
             "threshold": float(args.threshold),
             "level": args.level,
+            "ensemble_recusal_policy": args.ensemble_recusal_policy,
             "episode_min_frames": int(args.episode_min_frames),
             "episode_max_gap": int(args.episode_max_gap),
             "episode_overlap_threshold": float(args.episode_overlap_threshold),

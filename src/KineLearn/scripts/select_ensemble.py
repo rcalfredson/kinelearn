@@ -84,19 +84,33 @@ def parse_args() -> argparse.Namespace:
         help="Optional minimum validation score candidates must meet before selection.",
     )
     parser.add_argument(
+        "--selection-mode",
+        choices=["band_diverse", "top_n"],
+        default="band_diverse",
+        help=(
+            "How to choose members after validation scoring: "
+            "'band_diverse' keeps an in-band set with a light outer-split diversity preference, "
+            "while 'top_n' uses strict score ranking (default: band_diverse)."
+        ),
+    )
+    parser.add_argument(
         "--band-tolerance",
         type=float,
         default=0.03,
         help=(
             "Keep candidates within this absolute metric distance of the best "
-            "validation score before diversity/cap filtering (default: 0.03)."
+            "validation score before diversity/cap filtering (default: 0.03). "
+            "Used only with --selection-mode band_diverse."
         ),
     )
     parser.add_argument(
         "--max-members",
         type=int,
-        default=5,
-        help="Maximum number of selected members to write into the ensemble (default: 5).",
+        default=None,
+        help=(
+            "Optional maximum number of selected members to write into the ensemble. "
+            "Leave unset to keep all candidates that survive the active selection filters."
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -249,13 +263,14 @@ def diversity_group(candidate: dict[str, Any]) -> str:
 def select_candidate_rows(
     scored_rows: list[dict[str, Any]],
     *,
+    selection_mode: str,
     min_score: float | None,
     band_tolerance: float,
-    max_members: int,
+    max_members: int | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     if not scored_rows:
         raise ValueError("No scored candidates are available for selection.")
-    if max_members < 2:
+    if max_members is not None and max_members < 2:
         raise ValueError("--max-members must be at least 2.")
     if band_tolerance < 0:
         raise ValueError("--band-tolerance must be non-negative.")
@@ -267,44 +282,61 @@ def select_candidate_rows(
         )
 
     best_score = prefiltered[0]["score"]
-    band_floor = best_score - band_tolerance
-    band_rows = [row for row in prefiltered if row["score"] >= band_floor]
-    if len(band_rows) < 2:
-        raise ValueError(
-            "Fewer than two candidates remain inside the stable selection band."
+    band_floor = None
+    n_in_band = None
+
+    if selection_mode == "top_n":
+        selected = (
+            list(prefiltered)
+            if max_members is None
+            else list(prefiltered[:max_members])
         )
+    elif selection_mode == "band_diverse":
+        band_floor = best_score - band_tolerance
+        band_rows = [row for row in prefiltered if row["score"] >= band_floor]
+        n_in_band = int(len(band_rows))
+        if len(band_rows) < 2:
+            raise ValueError(
+                "Fewer than two candidates remain inside the stable selection band."
+            )
 
-    selected: list[dict[str, Any]] = []
-    used_groups: set[str] = set()
-    for row in band_rows:
-        group = diversity_group(row)
-        if group in used_groups:
-            continue
-        selected.append(row)
-        used_groups.add(group)
-        if len(selected) >= max_members:
-            break
+        if max_members is None:
+            selected = list(band_rows)
+        else:
+            selected = []
+            used_groups: set[str] = set()
+            for row in band_rows:
+                group = diversity_group(row)
+                if group in used_groups:
+                    continue
+                selected.append(row)
+                used_groups.add(group)
+                if len(selected) >= max_members:
+                    break
 
-    if len(selected) < min(max_members, len(band_rows)):
-        selected_paths = {row["manifest_path"] for row in selected}
-        for row in band_rows:
-            if row["manifest_path"] in selected_paths:
-                continue
-            selected.append(row)
-            selected_paths.add(row["manifest_path"])
-            if len(selected) >= max_members:
-                break
+            if len(selected) < min(max_members, len(band_rows)):
+                selected_paths = {row["manifest_path"] for row in selected}
+                for row in band_rows:
+                    if row["manifest_path"] in selected_paths:
+                        continue
+                    selected.append(row)
+                    selected_paths.add(row["manifest_path"])
+                    if len(selected) >= max_members:
+                        break
+    else:
+        raise ValueError(f"Unsupported selection mode: {selection_mode}")
 
     if len(selected) < 2:
         raise ValueError("Selection must produce at least two ensemble members.")
 
     excluded = [row for row in scored_rows if row["manifest_path"] not in {r["manifest_path"] for r in selected}]
     summary = {
+        "selection_mode": selection_mode,
         "best_score": float(best_score),
-        "band_floor": float(band_floor),
+        "band_floor": float(band_floor) if band_floor is not None else None,
         "n_candidates": int(len(scored_rows)),
         "n_after_min_score": int(len(prefiltered)),
-        "n_in_band": int(len(band_rows)),
+        "n_in_band": n_in_band,
         "n_selected": int(len(selected)),
     }
     return selected, excluded, summary
@@ -315,8 +347,9 @@ def candidate_csv_rows(
     selected_paths: set[Path],
     *,
     metric: str,
+    selection_mode: str,
     best_score: float,
-    band_floor: float,
+    band_floor: float | None,
     min_score: float | None,
 ) -> list[dict[str, Any]]:
     rows = []
@@ -328,6 +361,7 @@ def candidate_csv_rows(
                 "behavior": row["manifest"]["behavior"],
                 "score_metric": metric,
                 "score": float(row["score"]),
+                "selection_mode": selection_mode,
                 "selected": row["manifest_path"] in selected_paths,
                 "source_kind": row["source_kind"],
                 "source_path": row["source_path"],
@@ -343,7 +377,7 @@ def candidate_csv_rows(
                 "episode_recall": metric_row.get("recall") if row["score_level"] == "episode" else None,
                 "episode_f1": metric_row.get("f1") if row["score_level"] == "episode" else None,
                 "best_score": float(best_score),
-                "band_floor": float(band_floor),
+                "band_floor": float(band_floor) if band_floor is not None else None,
                 "min_score": min_score,
             }
         )
@@ -370,6 +404,11 @@ def main() -> None:
         raise ValueError("--threshold must be between 0 and 1.")
     if args.min_score is not None and not (0.0 <= args.min_score <= 1.0):
         raise ValueError("--min-score must be between 0 and 1 when provided.")
+    if args.selection_mode == "top_n" and args.max_members is None and args.min_score is None:
+        raise ValueError(
+            "top_n without --max-members or --min-score would select every candidate. "
+            "Set at least one of those filters explicitly."
+        )
     if args.batch_size is not None and args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     if args.episode_min_frames <= 0:
@@ -392,9 +431,10 @@ def main() -> None:
     scored_rows = score_candidates(loaded_candidates, args)
     selected_rows, excluded_rows, selection_stats = select_candidate_rows(
         scored_rows,
+        selection_mode=args.selection_mode,
         min_score=args.min_score,
         band_tolerance=float(args.band_tolerance),
-        max_members=int(args.max_members),
+        max_members=args.max_members,
     )
 
     selected_paths = [row["manifest_path"] for row in selected_rows]
@@ -416,6 +456,7 @@ def main() -> None:
         scored_rows,
         selected_set,
         metric=args.metric,
+        selection_mode=args.selection_mode,
         best_score=selection_stats["best_score"],
         band_floor=selection_stats["band_floor"],
         min_score=args.min_score,
@@ -428,11 +469,12 @@ def main() -> None:
         "ensemble_name": args.name,
         "ensemble_manifest": str(ensemble_path.resolve()),
         "metric": args.metric,
+        "selection_mode": args.selection_mode,
         "subset": "val",
         "threshold": float(args.threshold),
         "min_score": args.min_score,
         "band_tolerance": float(args.band_tolerance),
-        "max_members": int(args.max_members),
+        "max_members": int(args.max_members) if args.max_members is not None else None,
         "episode_settings": {
             "min_pred_frames": int(args.episode_min_frames),
             "max_gap": int(args.episode_max_gap),

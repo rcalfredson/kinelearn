@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -173,6 +174,19 @@ def inference_signature(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def recusal_stems(manifest: dict[str, Any], *, policy: str = "train_val") -> set[str]:
+    resolved = manifest.get("resolved_stems") or {}
+    train_stems = {str(stem) for stem in (resolved.get("train") or [])}
+    val_stems = {str(stem) for stem in (resolved.get("val") or [])}
+
+    if policy == "train":
+        return train_stems
+    if policy == "train_val":
+        return train_stems | val_stems
+
+    raise ValueError(f"Unsupported recusal policy: {policy}")
+
+
 def selection_signature(manifest: dict[str, Any]) -> dict[str, Any]:
     training_cfg = dict((manifest.get("training") or {}))
     training_cfg.pop("seed", None)
@@ -303,6 +317,7 @@ def load_prediction_source(path: Path) -> dict[str, Any]:
         return {
             "manifest_kind": "ensemble",
             "manifest_path": path.resolve(),
+            "kl_config": member_manifests[0].get("kl_config"),
             **recorded,
             "aggregation": dict(ensemble_manifest["aggregation"]),
             "members": [
@@ -319,6 +334,7 @@ def load_prediction_source(path: Path) -> dict[str, Any]:
     return {
         "manifest_kind": "train",
         "manifest_path": path.resolve(),
+        "kl_config": manifest.get("kl_config"),
         **inference_signature(manifest),
         "aggregation": {"method": "mean_probability", "n_members": 1},
         "members": [
