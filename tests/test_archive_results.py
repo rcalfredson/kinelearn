@@ -279,6 +279,30 @@ class ArchiveResultsTests(unittest.TestCase):
             self.assertTrue((destination / "nested" / "train_manifest.yml").exists())
             self.assertFalse((destination / "nested" / "train_features.fp32").exists())
 
+    def test_build_archive_plan_allows_existing_gitkeep_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "results"
+            destination = root / "archive"
+            source.mkdir(parents=True, exist_ok=True)
+            destination.mkdir(parents=True, exist_ok=True)
+
+            (source / ".gitkeep").write_text("")
+            (source / "behavior" / "run_a").mkdir(parents=True, exist_ok=True)
+            (source / "behavior" / "run_a" / "train_manifest.yml").write_text(
+                "training_run: {}\n"
+            )
+            (destination / ".gitkeep").write_text("")
+
+            plan = build_archive_plan(source, destination)
+
+            moved_destinations = {dst for _, dst, _ in plan.moved_files}
+            self.assertIn(destination / ".gitkeep", moved_destinations)
+            self.assertIn(
+                destination / "behavior" / "run_a" / "train_manifest.yml",
+                moved_destinations,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ TRAINING_ARTIFACT_NAMES = {
     "train_history.csv",
 }
 TRAINING_ARTIFACT_SUFFIXES = ("_vids.npy", "_starts.npy", *OMIT_SUFFIXES)
+SAFE_COLLISION_FILENAMES = {".gitkeep"}
 
 
 @dataclass(frozen=True)
@@ -287,7 +288,8 @@ def validate_destination_plan(
 
     for _, dest_path, _ in moved_files:
         if dest_path.exists():
-            collisions.append(dest_path)
+            if dest_path.name not in SAFE_COLLISION_FILENAMES:
+                collisions.append(dest_path)
             continue
 
         parent = dest_path.parent
