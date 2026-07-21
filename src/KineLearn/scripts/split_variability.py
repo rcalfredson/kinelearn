@@ -127,6 +127,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional training-time keypoint noise std override passed through to kinelearn-train.",
     )
     parser.add_argument(
+        "--steps-per-execution",
+        type=int,
+        default=None,
+        help="Optional training.steps_per_execution override passed through to kinelearn-train.",
+    )
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=None,
+        help="Optional training.inference_batch_size override passed through to kinelearn-train.",
+    )
+    parser.add_argument(
         "--train-command",
         default="kinelearn-train",
         help="Training executable to invoke when --execute is set.",
@@ -270,6 +282,14 @@ def build_plan(
                 command.extend(["--focal-alpha", str(args.focal_alpha)])
             if args.keypoint_noise_std is not None:
                 command.extend(["--keypoint-noise-std", str(args.keypoint_noise_std)])
+            if args.steps_per_execution is not None:
+                command.extend(
+                    ["--steps-per-execution", str(args.steps_per_execution)]
+                )
+            if args.inference_batch_size is not None:
+                command.extend(
+                    ["--inference-batch-size", str(args.inference_batch_size)]
+                )
 
             runs.append(
                 {
@@ -671,6 +691,16 @@ def main() -> None:
             "keypoint_noise_std": (
                 float(args.keypoint_noise_std)
                 if args.keypoint_noise_std is not None
+                else None
+            ),
+            "steps_per_execution": (
+                int(args.steps_per_execution)
+                if args.steps_per_execution is not None
+                else None
+            ),
+            "inference_batch_size": (
+                int(args.inference_batch_size)
+                if args.inference_batch_size is not None
                 else None
             ),
             "val_fraction": float(val_fraction),

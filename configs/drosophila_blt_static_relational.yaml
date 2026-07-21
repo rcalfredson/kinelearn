@@ -78,6 +78,8 @@ window:
 
 training:
   batch_size: 8
+  steps_per_execution: 1
+  inference_batch_size: 8
   epochs: 15
   learning_rate: 0.001
   include_absolute_coordinates: false

@@ -476,6 +476,8 @@ Optional CLI overrides:
 - `--val-split` to provide an explicit train/validation split file instead of deriving validation videos from `training.val_fraction`
 - `--epochs` to override `training.epochs`
 - `--batch-size` to override `training.batch_size`
+- `--steps-per-execution` to override `training.steps_per_execution`
+- `--inference-batch-size` to override `training.inference_batch_size`
 - `--seed` to override `training.seed` for a specific run
 - `--focal-alpha` to override the focal-loss alpha for a specific training run
 - `--keypoint-noise-std` to override the training-time Gaussian noise std for a specific run
@@ -483,6 +485,8 @@ Optional CLI overrides:
 
 Training config note:
 - Set `training.include_absolute_coordinates: false` to exclude raw absolute `*_x` / `*_y` keypoint columns from model input while still retaining derived motion and geometry features.
+- Set `training.steps_per_execution` to run multiple training batches inside each compiled TensorFlow call. This does not change the optimizer batch size or the number of weight updates; it defaults to `1`.
+- Set `training.inference_batch_size` to independently increase batching for validation, checkpoint scoring, and final test inference. It defaults to `training.batch_size`.
 - Set `training.early_stopping: true` to stop early when `val_loss` stops improving; `training.early_stopping_patience` and `training.early_stopping_min_delta` control its sensitivity.
 - Set `training.checkpoint_selection.enabled: true` to retain the epoch and probability threshold with the best reconstructed validation episode F1. When episode-aware selection is enabled, early stopping monitors that epoch-level episode F1 instead of `val_loss`.
 - Use `--seed` when you want to change the train/validation split for a run without editing the config file; the resolved seed used for that run is recorded in the training manifest.
@@ -590,6 +594,8 @@ kinelearn-split-variability \
   --seed 0 \
   --focal-alpha 0.67 \
   --keypoint-noise-std 0.01 \
+  --steps-per-execution 32 \
+  --inference-batch-size 256 \
   --execute \
   --out-dir results/split_variability/ge_fixed_test
 ```

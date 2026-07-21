@@ -281,6 +281,30 @@ def resolve_keypoint_noise_std(training_cfg: Dict, behavior: str) -> float:
     return float(noise_cfg)
 
 
+def _positive_integer_setting(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"training.{name} must be a positive integer.")
+    resolved = int(value)
+    if resolved <= 0:
+        raise ValueError(f"training.{name} must be a positive integer.")
+    return resolved
+
+
+def resolve_execution_settings(training_cfg: Dict) -> tuple[int, int, int]:
+    """Resolve optimizer, compiled-loop, and inference batch settings."""
+    batch_size = _positive_integer_setting(
+        training_cfg.get("batch_size", 8), "batch_size"
+    )
+    steps_per_execution = _positive_integer_setting(
+        training_cfg.get("steps_per_execution", 1), "steps_per_execution"
+    )
+    inference_batch_size = _positive_integer_setting(
+        training_cfg.get("inference_batch_size", batch_size),
+        "inference_batch_size",
+    )
+    return batch_size, steps_per_execution, inference_batch_size
+
+
 def checkpoint_thresholds(selection_cfg: dict[str, Any]) -> list[float]:
     """Resolve an explicit, finite probability-threshold grid."""
     threshold_cfg = selection_cfg.get("thresholds")
@@ -678,6 +702,21 @@ def main():
         help="Override batch_size from config (optional).",
     )
     parser.add_argument(
+        "--steps-per-execution",
+        type=int,
+        default=None,
+        help="Override training.steps_per_execution from config (optional).",
+    )
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Override training.inference_batch_size for validation, checkpoint "
+            "selection, and final test evaluation (optional)."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -735,6 +774,10 @@ def main():
         training_cfg["epochs"] = args.epochs
     if args.batch_size is not None:
         training_cfg["batch_size"] = args.batch_size
+    if args.steps_per_execution is not None:
+        training_cfg["steps_per_execution"] = args.steps_per_execution
+    if args.inference_batch_size is not None:
+        training_cfg["inference_batch_size"] = args.inference_batch_size
     if args.seed is not None:
         training_cfg["seed"] = int(args.seed)
     if args.focal_alpha is not None:
@@ -746,6 +789,8 @@ def main():
     # Provide some sane defaults (used later when we add training)
     training_cfg.setdefault("epochs", 10)
     training_cfg.setdefault("batch_size", 8)
+    training_cfg.setdefault("steps_per_execution", 1)
+    training_cfg.setdefault("inference_batch_size", training_cfg["batch_size"])
     training_cfg.setdefault("learning_rate", 1e-3)
     training_cfg.setdefault(
         "loss", "focal"
@@ -763,6 +808,12 @@ def main():
     training_cfg.setdefault("final_zero_fill", False)
     checkpoint_selection_cfg = resolve_checkpoint_selection_config(training_cfg)
     training_cfg["checkpoint_selection"] = checkpoint_selection_cfg
+    batch_size, steps_per_execution, inference_batch_size = (
+        resolve_execution_settings(training_cfg)
+    )
+    training_cfg["batch_size"] = batch_size
+    training_cfg["steps_per_execution"] = steps_per_execution
+    training_cfg["inference_batch_size"] = inference_batch_size
 
     # Resolve focal params (alpha can be global or per-behavior)
     alpha, gamma = resolve_focal_params(training_cfg, behavior)
@@ -772,6 +823,8 @@ def main():
     for k in [
         "epochs",
         "batch_size",
+        "steps_per_execution",
+        "inference_batch_size",
         "learning_rate",
         "loss",
         "metrics",
@@ -1154,7 +1207,6 @@ def main():
     # ----------------------------
     # Generators (keypoints-only)
     # ----------------------------
-    batch_size = int(training_cfg["batch_size"])
     train_gen = KeypointWindowGenerator(
         mmX_tr,
         mmY_tr,
@@ -1168,7 +1220,7 @@ def main():
         mmX_va,
         mmY_va,
         behavior_idx=behavior_idx,
-        batch_size=batch_size,
+        batch_size=inference_batch_size,
         shuffle=False,
         seed=seed,
         noise_std=0.0,
@@ -1177,7 +1229,7 @@ def main():
         mmX_te,
         mmY_te,
         behavior_idx=behavior_idx,
-        batch_size=batch_size,
+        batch_size=inference_batch_size,
         shuffle=False,
         seed=seed,
         noise_std=0.0,
@@ -1207,6 +1259,7 @@ def main():
         optimizer=tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0),
         loss=loss_fn,
         metrics=metrics,
+        steps_per_execution=steps_per_execution,
     )
 
     # ----------------------------
@@ -1225,7 +1278,7 @@ def main():
             behavior=behavior,
             behavior_idx=behavior_idx,
             window_size=wsize,
-            batch_size=batch_size,
+            batch_size=inference_batch_size,
             selection_cfg=checkpoint_selection_cfg,
             checkpoint_path=ckpt_path,
             output_dir=out,

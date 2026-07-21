@@ -15,6 +15,7 @@ from KineLearn.scripts.train import (
     checkpoint_candidate_rank,
     checkpoint_thresholds,
     resolve_checkpoint_selection_config,
+    resolve_execution_settings,
     select_checkpoint_candidate,
 )
 
@@ -66,6 +67,39 @@ class CheckpointSelectionConfigTests(unittest.TestCase):
         self.assertEqual(cfg["metric"], "episode_f1")
         self.assertEqual(cfg["thresholds"][0], 0.35)
         self.assertEqual(cfg["thresholds"][-1], 0.75)
+
+
+class ExecutionSettingsTests(unittest.TestCase):
+    def test_defaults_preserve_existing_batching_behavior(self) -> None:
+        self.assertEqual(resolve_execution_settings({}), (8, 1, 8))
+        self.assertEqual(
+            resolve_execution_settings({"batch_size": 16}),
+            (16, 1, 16),
+        )
+
+    def test_independent_execution_and_inference_settings(self) -> None:
+        self.assertEqual(
+            resolve_execution_settings(
+                {
+                    "batch_size": 8,
+                    "steps_per_execution": 32,
+                    "inference_batch_size": 256,
+                }
+            ),
+            (8, 32, 256),
+        )
+
+    def test_nonpositive_or_noninteger_settings_are_rejected(self) -> None:
+        for name, value in [
+            ("batch_size", 0),
+            ("steps_per_execution", -1),
+            ("inference_batch_size", 0),
+            ("steps_per_execution", True),
+            ("inference_batch_size", 8.5),
+        ]:
+            with self.subTest(name=name, value=value):
+                with self.assertRaisesRegex(ValueError, name):
+                    resolve_execution_settings({name: value})
 
 
 class CheckpointCandidateRankingTests(unittest.TestCase):

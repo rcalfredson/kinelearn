@@ -23,10 +23,12 @@ sys.modules.setdefault("sklearn", sklearn)
 sys.modules.setdefault("sklearn.model_selection", model_selection)
 
 from KineLearn.scripts.split_variability import (
+    build_plan,
     enrich_summary_row_from_manifest,
     inspect_resume_runs,
     main,
 )
+from KineLearn.scripts import split_variability as split_variability_script
 
 
 def write_plan_csv(path: Path, rows: list[dict[str, str]]) -> None:
@@ -52,6 +54,46 @@ def write_plan_csv(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 class SplitVariabilityResumeTests(unittest.TestCase):
+    def test_build_plan_passes_execution_overrides_to_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            split_path = root / "split.yaml"
+            split_path.write_text(
+                "train:\n  - a\n  - b\n  - c\n  - d\ntest:\n  - e\n"
+            )
+            args = types.SimpleNamespace(
+                base_split=str(split_path),
+                video_list=None,
+                outer_seeds=[],
+                test_fraction=0.2,
+                inner_seeds=[7],
+                train_command="kinelearn-train",
+                kl_config="config.yaml",
+                behavior="back_leg_together",
+                features_dir="features",
+                seed=0,
+                focal_alpha=None,
+                keypoint_noise_std=None,
+                steps_per_execution=32,
+                inference_batch_size=256,
+            )
+            original_split = split_variability_script.train_test_split
+            split_variability_script.train_test_split = (
+                lambda values, **_kwargs: (list(values[:-1]), [values[-1]])
+            )
+            try:
+                runs = build_plan(args, root / "sweep", val_fraction=0.25)
+            finally:
+                split_variability_script.train_test_split = original_split
+
+            command = runs[0]["command"]
+            self.assertEqual(
+                command[command.index("--steps-per-execution") + 1], "32"
+            )
+            self.assertEqual(
+                command[command.index("--inference-batch-size") + 1], "256"
+            )
+
     def test_summary_metrics_are_rehydrated_from_completed_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manifest_path = Path(tmpdir) / "train_manifest.yml"
