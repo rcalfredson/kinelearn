@@ -494,16 +494,24 @@ Training config note:
 - Use `--focal-alpha` when you want to tune alpha per split without changing the project-wide default in your config file; the resolved alpha used for that run is still recorded in the run manifest.
 - Use `--keypoint-noise-std` when you want to tune training-time noise per run without changing the project-wide default in your config file; the resolved noise value used for that run is still recorded in the run manifest.
 
-For a staged throughput benchmark of the back-leg static-relational model, use the following configs in order. The base config is the control; subsequent configs first isolate `steps_per_execution`, then hold it at `32` while increasing inference batching:
+For a staged throughput benchmark of the back-leg static-relational model, use
+the following explicitly named configs in order. They first isolate
+`steps_per_execution`, then hold it at `32` while increasing inference batching:
 
 | Config | Steps per execution | Inference batch size |
 |---|---:|---:|
-| `configs/drosophila_blt_static_relational.yaml` | 1 | 8 |
+| `configs/drosophila_blt_static_relational_spe1_ib8.yaml` | 1 | 8 |
 | `configs/drosophila_blt_static_relational_spe8_ib8.yaml` | 8 | 8 |
 | `configs/drosophila_blt_static_relational_spe32_ib8.yaml` | 32 | 8 |
 | `configs/drosophila_blt_static_relational_spe32_ib32.yaml` | 32 | 32 |
 | `configs/drosophila_blt_static_relational_spe32_ib128.yaml` | 32 | 128 |
 | `configs/drosophila_blt_static_relational_spe32_ib256.yaml` | 32 | 256 |
+
+The benchmark selected `steps_per_execution: 32` and
+`inference_batch_size: 128`, which are now the defaults in
+`configs/drosophila_blt_static_relational.yaml`. The explicitly named files
+above preserve every measured benchmark configuration, including the original
+control.
 
 Run each benchmark on the same split, training seed, and machine. Stop increasing the inference batch size if GPU memory becomes marginal; these settings change batching and execution overhead, not the model architecture or optimizer update semantics.
 
