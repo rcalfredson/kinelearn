@@ -494,6 +494,19 @@ Training config note:
 - Use `--focal-alpha` when you want to tune alpha per split without changing the project-wide default in your config file; the resolved alpha used for that run is still recorded in the run manifest.
 - Use `--keypoint-noise-std` when you want to tune training-time noise per run without changing the project-wide default in your config file; the resolved noise value used for that run is still recorded in the run manifest.
 
+For a staged throughput benchmark of the back-leg static-relational model, use the following configs in order. The base config is the control; subsequent configs first isolate `steps_per_execution`, then hold it at `32` while increasing inference batching:
+
+| Config | Steps per execution | Inference batch size |
+|---|---:|---:|
+| `configs/drosophila_blt_static_relational.yaml` | 1 | 8 |
+| `configs/drosophila_blt_static_relational_spe8_ib8.yaml` | 8 | 8 |
+| `configs/drosophila_blt_static_relational_spe32_ib8.yaml` | 32 | 8 |
+| `configs/drosophila_blt_static_relational_spe32_ib32.yaml` | 32 | 32 |
+| `configs/drosophila_blt_static_relational_spe32_ib128.yaml` | 32 | 128 |
+| `configs/drosophila_blt_static_relational_spe32_ib256.yaml` | 32 | 256 |
+
+Run each benchmark on the same split, training seed, and machine. Stop increasing the inference batch size if GPU memory becomes marginal; these settings change batching and execution overhead, not the model architecture or optimizer update semantics.
+
 ### Selecting checkpoints by validation episodes
 
 The default training path retains the epoch with minimum `val_loss`. For a behavior whose target is episode-level F1, precision, and recall, you can instead evaluate reconstructed validation-frame probabilities at the end of every epoch and jointly select the epoch and decision threshold:

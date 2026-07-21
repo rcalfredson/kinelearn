@@ -216,6 +216,7 @@ configs/*
 !configs/drosophila_example.yaml
 !configs/drosophila_bilstm_episode_checkpoint.yaml
 !configs/drosophila_blt_static_relational.yaml
+!configs/drosophila_blt_static_relational_spe*.yaml
 features/*
 !features/.gitkeep
 features_blt_static_relational/
