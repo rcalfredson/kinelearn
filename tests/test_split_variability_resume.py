@@ -22,7 +22,11 @@ sklearn.model_selection = model_selection
 sys.modules.setdefault("sklearn", sklearn)
 sys.modules.setdefault("sklearn.model_selection", model_selection)
 
-from KineLearn.scripts.split_variability import inspect_resume_runs, main
+from KineLearn.scripts.split_variability import (
+    enrich_summary_row_from_manifest,
+    inspect_resume_runs,
+    main,
+)
 
 
 def write_plan_csv(path: Path, rows: list[dict[str, str]]) -> None:
@@ -48,6 +52,36 @@ def write_plan_csv(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 class SplitVariabilityResumeTests(unittest.TestCase):
+    def test_summary_metrics_are_rehydrated_from_completed_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "train_manifest.yml"
+            manifest_path.write_text(
+                "training_run:\n"
+                "  best_epoch_by_val_loss: 1\n"
+                "  epochs_completed: 7\n"
+                "  checkpoint_selection:\n"
+                "    enabled: true\n"
+                "    selected:\n"
+                "      epoch: 2\n"
+                "      threshold: 0.63\n"
+                "      f1: 0.72\n"
+                "      precision: 0.64\n"
+                "      recall: 0.82\n"
+                "  test_metrics:\n"
+                "    loss: 0.01\n"
+            )
+
+            row = enrich_summary_row_from_manifest({}, manifest_path)
+
+            self.assertEqual(row["best_epoch_by_val_loss"], 1)
+            self.assertEqual(row["epochs_completed"], 7)
+            self.assertEqual(row["best_epoch_by_checkpoint_selection"], 2)
+            self.assertEqual(row["selected_threshold"], 0.63)
+            self.assertEqual(row["selected_val_episode_f1"], 0.72)
+            self.assertEqual(row["selected_val_episode_precision"], 0.64)
+            self.assertEqual(row["selected_val_episode_recall"], 0.82)
+            self.assertEqual(row["test_loss"], 0.01)
+
     def test_inspect_resume_runs_classifies_complete_and_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

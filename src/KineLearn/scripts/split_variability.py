@@ -516,6 +516,28 @@ def validate_new_plan_args(args: argparse.Namespace) -> None:
         )
 
 
+def enrich_summary_row_from_manifest(
+    row: dict[str, Any], manifest_path: Path
+) -> dict[str, Any]:
+    """Add recorded training and checkpoint metrics to a sweep summary row."""
+    manifest = load_yaml(manifest_path)
+    training_run = manifest.get("training_run", {})
+    test_metrics = training_run.get("test_metrics", {})
+    checkpoint_selection = training_run.get("checkpoint_selection") or {}
+    selected_checkpoint = checkpoint_selection.get("selected") or {}
+
+    row["best_epoch_by_val_loss"] = training_run.get("best_epoch_by_val_loss")
+    row["epochs_completed"] = training_run.get("epochs_completed")
+    row["best_epoch_by_checkpoint_selection"] = selected_checkpoint.get("epoch")
+    row["selected_threshold"] = selected_checkpoint.get("threshold")
+    row["selected_val_episode_f1"] = selected_checkpoint.get("f1")
+    row["selected_val_episode_precision"] = selected_checkpoint.get("precision")
+    row["selected_val_episode_recall"] = selected_checkpoint.get("recall")
+    for key, value in test_metrics.items():
+        row[f"test_{key}"] = value
+    return row
+
+
 def execute_runs(
     runs: list[dict[str, Any]],
     *,
@@ -526,19 +548,20 @@ def execute_runs(
 
     for idx, run in enumerate(runs, start=1):
         if run["state"] == "complete":
-            summary_rows.append(
-                {
-                    "outer_id": run["outer_id"],
-                    "outer_seed": run.get("outer_seed"),
-                    "inner_seed": run["inner_seed"],
-                    "split_path": run["split_path"],
-                    "val_split_path": run["val_split_path"],
-                    "run_output_dir": run["run_output_dir"],
-                    "status": "complete_existing",
-                    "returncode": 0,
-                    "manifest_path": run["manifest_path"],
-                }
-            )
+            manifest_path = Path(run["manifest_path"])
+            row = {
+                "outer_id": run["outer_id"],
+                "outer_seed": run.get("outer_seed"),
+                "inner_seed": run["inner_seed"],
+                "split_path": run["split_path"],
+                "val_split_path": run["val_split_path"],
+                "run_output_dir": run["run_output_dir"],
+                "status": "complete_existing",
+                "returncode": 0,
+                "manifest_path": run["manifest_path"],
+            }
+            enrich_summary_row_from_manifest(row, manifest_path)
+            summary_rows.append(row)
             aggregate_results(out_dir / "results_summary.csv", summary_rows)
             continue
 
@@ -585,13 +608,7 @@ def execute_runs(
         }
 
         if manifest_path is not None and manifest_path.exists():
-            manifest = load_yaml(manifest_path)
-            training_run = manifest.get("training_run", {})
-            test_metrics = training_run.get("test_metrics", {})
-            row["best_epoch_by_val_loss"] = training_run.get("best_epoch_by_val_loss")
-            row["epochs_completed"] = training_run.get("epochs_completed")
-            for key, value in test_metrics.items():
-                row[f"test_{key}"] = value
+            enrich_summary_row_from_manifest(row, manifest_path)
 
         summary_rows.append(row)
         aggregate_results(out_dir / "results_summary.csv", summary_rows)

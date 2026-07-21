@@ -407,7 +407,7 @@ It performs:
 2. **Splitting into train/val/test** — uses the split file from `kinelearn-split`, applying the validation fraction defined in your config unless you provide an explicit validation split.
 3. **Windowing the data** — converts frame-level features and labels into overlapping windows stored as efficient `.memmap` arrays.
 4. **Building generators and model** — creates memmap-backed Keras generators and a keypoints-only BiLSTM model for the selected behavior.
-5. **Training with focal loss** — optimizes a per-timestep sigmoid classifier, checkpointing on `val_loss`, with optional early stopping.
+5. **Training with focal loss** — optimizes a per-timestep sigmoid classifier, checkpointing on `val_loss` by default or, when enabled, reconstructed validation episode F1.
 6. **Evaluating on test data** — reloads the best checkpointed weights and reports test metrics.
 7. **Recording outputs** — saves all artifacts into a run-specific directory under `results/<behavior>/<timestamp>/`, including a `train_manifest.yml` file summarizing dataset sizes, feature dimensions, training hyperparameters, artifact paths, and evaluation results.
    You can also provide `--out-dir` when you want to place a run in an explicit directory instead of using a timestamped one.
@@ -447,10 +447,40 @@ Optional CLI overrides:
 Training config note:
 - Set `training.include_absolute_coordinates: false` to exclude raw absolute `*_x` / `*_y` keypoint columns from model input while still retaining derived motion and geometry features.
 - Set `training.early_stopping: true` to stop early when `val_loss` stops improving; `training.early_stopping_patience` and `training.early_stopping_min_delta` control its sensitivity.
+- Set `training.checkpoint_selection.enabled: true` to retain the epoch and probability threshold with the best reconstructed validation episode F1. When episode-aware selection is enabled, early stopping monitors that epoch-level episode F1 instead of `val_loss`.
 - Use `--seed` when you want to change the train/validation split for a run without editing the config file; the resolved seed used for that run is recorded in the training manifest.
 - Use `--val-split` when you need a fixed, explicit train/validation partition. The resolved `split`, `val_split`, and train/val/test video stems are recorded in `train_manifest.yml` for traceability.
 - Use `--focal-alpha` when you want to tune alpha per split without changing the project-wide default in your config file; the resolved alpha used for that run is still recorded in the run manifest.
 - Use `--keypoint-noise-std` when you want to tune training-time noise per run without changing the project-wide default in your config file; the resolved noise value used for that run is still recorded in the run manifest.
+
+### Selecting checkpoints by validation episodes
+
+The default training path retains the epoch with minimum `val_loss`. For a behavior whose target is episode-level F1, precision, and recall, you can instead evaluate reconstructed validation-frame probabilities at the end of every epoch and jointly select the epoch and decision threshold:
+
+```yaml
+training:
+  checkpoint_selection:
+    enabled: true
+    metric: episode_f1
+    thresholds:
+      start: 0.35
+      stop: 0.75
+      step: 0.01
+    episode_min_frames: 16
+    episode_max_gap: 3
+    episode_overlap_threshold: 0.2
+```
+
+Selection ranks candidates first by episode F1, then by the smaller of episode precision and recall. Remaining ties prefer higher precision, higher recall, and finally a threshold closer to `0.5`; exactly equidistant thresholds prefer the lower value. The selector scores every configured threshold after each epoch but keeps only the best weights, avoiding a directory full of temporary checkpoints.
+
+An enabled run adds:
+
+- `checkpoint_candidates.csv`, containing every epoch/threshold candidate and its validation episode metrics
+- `checkpoint_selection_summary.yml`, containing the selection settings and current winner
+- `checkpoint_selection_val_predictions.parquet`, containing reconstructed validation probabilities and predictions for the winner
+- `training_run.checkpoint_selection` in `train_manifest.yml`, containing the selected epoch, threshold, metrics, and artifact paths
+
+The selected threshold is validation-derived. Keep the outer test subset out of checkpoint and threshold selection, and use it only after the development recipe has been locked.
 
 ### Tuning focal alpha in practice
 
@@ -693,6 +723,14 @@ Optional CLI arguments:
 - `--episode-overlap-threshold` to control predicted/ground-truth episode matching (default: `0.2`)
 - `--batch-size` to override the evaluation batch size
 - `--out` to choose the evaluation output directory
+
+Episode matching is one-to-one: each predicted episode and each ground-truth
+episode can contribute to at most one true positive. Eligible pairs retain the
+historical overlap rule (the intersection must cover at least the configured
+fraction of the predicted episode), and a deterministic maximum-cardinality
+matching resolves ambiguous pairs. Consequently, extra fragments around one
+ground-truth episode are counted as false positives rather than additional true
+positives.
 
 This will write:
 - `results/evaluations/<timestamp>/eval_summary.yml`

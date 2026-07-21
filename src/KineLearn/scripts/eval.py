@@ -294,37 +294,12 @@ def compute_bout_level_metrics(
     *,
     overlap_threshold: float = 0.2,
 ) -> dict[str, Any]:
-    tp = 0
-    matched_gt = 0
-
-    for pred_bout in pred_bouts:
-        pred_len = pred_bout[1] - pred_bout[0] + 1
-        matched = False
-        for gt_bout in gt_bouts:
-            overlap = max(
-                0, min(pred_bout[1], gt_bout[1]) - max(pred_bout[0], gt_bout[0]) + 1
-            )
-            if overlap >= overlap_threshold * pred_len:
-                matched = True
-        if matched:
-            tp += 1
-
+    matches = match_bouts_one_to_one(
+        pred_bouts, gt_bouts, overlap_threshold=overlap_threshold
+    )
+    tp = len(matches)
     fp = len(pred_bouts) - tp
-
-    for gt_bout in gt_bouts:
-        matched = False
-        for pred_bout in pred_bouts:
-            pred_len = pred_bout[1] - pred_bout[0] + 1
-            overlap = max(
-                0, min(pred_bout[1], gt_bout[1]) - max(pred_bout[0], gt_bout[0]) + 1
-            )
-            if overlap >= overlap_threshold * pred_len:
-                matched = True
-                break
-        if matched:
-            matched_gt += 1
-
-    fn = len(gt_bouts) - matched_gt
+    fn = len(gt_bouts) - tp
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = (
@@ -342,24 +317,75 @@ def compute_bout_level_metrics(
     }
 
 
+def bout_overlap(
+    pred_bout: tuple[int, int], gt_bout: tuple[int, int]
+) -> int:
+    return max(
+        0,
+        min(pred_bout[1], gt_bout[1]) - max(pred_bout[0], gt_bout[0]) + 1,
+    )
+
+
+def match_bouts_one_to_one(
+    pred_bouts: list[tuple[int, int]],
+    gt_bouts: list[tuple[int, int]],
+    *,
+    overlap_threshold: float = 0.2,
+) -> list[tuple[int, int]]:
+    """
+    Return a maximum-cardinality one-to-one set of ``(pred_idx, gt_idx)`` matches.
+
+    Eligibility preserves KineLearn's historical rule: overlap must cover at
+    least ``overlap_threshold`` of the predicted bout. Candidate ground-truth
+    bouts are considered by greatest predicted-bout overlap first so ambiguous
+    maximum matchings are deterministic and favor stronger overlaps.
+    """
+    candidates: dict[int, list[int]] = {}
+    for pred_idx, pred_bout in enumerate(pred_bouts):
+        pred_len = pred_bout[1] - pred_bout[0] + 1
+        eligible = []
+        for gt_idx, gt_bout in enumerate(gt_bouts):
+            overlap = bout_overlap(pred_bout, gt_bout)
+            if overlap >= overlap_threshold * pred_len:
+                eligible.append((gt_idx, overlap))
+        candidates[pred_idx] = [
+            gt_idx
+            for gt_idx, _overlap in sorted(
+                eligible, key=lambda item: (-item[1], item[0])
+            )
+        ]
+
+    gt_to_pred: dict[int, int] = {}
+
+    def augment(pred_idx: int, seen_gt: set[int]) -> bool:
+        for gt_idx in candidates[pred_idx]:
+            if gt_idx in seen_gt:
+                continue
+            seen_gt.add(gt_idx)
+            current_pred = gt_to_pred.get(gt_idx)
+            if current_pred is None or augment(current_pred, seen_gt):
+                gt_to_pred[gt_idx] = pred_idx
+                return True
+        return False
+
+    pred_order = sorted(candidates, key=lambda idx: (len(candidates[idx]), idx))
+    for pred_idx in pred_order:
+        augment(pred_idx, set())
+
+    return sorted((pred_idx, gt_idx) for gt_idx, pred_idx in gt_to_pred.items())
+
+
 def identify_bout_errors(
     pred_bouts: list[tuple[int, int]],
     gt_bouts: list[tuple[int, int]],
     *,
     overlap_threshold: float = 0.2,
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    matched_pred = set()
-    matched_gt = set()
-
-    for i, pred_bout in enumerate(pred_bouts):
-        pred_len = pred_bout[1] - pred_bout[0] + 1
-        for j, gt_bout in enumerate(gt_bouts):
-            overlap = max(
-                0, min(pred_bout[1], gt_bout[1]) - max(pred_bout[0], gt_bout[0]) + 1
-            )
-            if overlap >= overlap_threshold * pred_len:
-                matched_pred.add(i)
-                matched_gt.add(j)
+    matches = match_bouts_one_to_one(
+        pred_bouts, gt_bouts, overlap_threshold=overlap_threshold
+    )
+    matched_pred = {pred_idx for pred_idx, _gt_idx in matches}
+    matched_gt = {gt_idx for _pred_idx, gt_idx in matches}
 
     fp_bouts = [pred_bouts[i] for i in range(len(pred_bouts)) if i not in matched_pred]
     fn_bouts = [gt_bouts[j] for j in range(len(gt_bouts)) if j not in matched_gt]

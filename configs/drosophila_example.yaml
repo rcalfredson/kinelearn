@@ -66,6 +66,18 @@ training:
   early_stopping: true
   early_stopping_patience: 3
   early_stopping_min_delta: 0.0
+  # Optional: select the retained checkpoint using reconstructed validation
+  # episodes instead of window-level val_loss.
+  checkpoint_selection:
+    enabled: false
+    metric: episode_f1
+    thresholds:
+      start: 0.35
+      stop: 0.75
+      step: 0.01
+    episode_min_frames: 16
+    episode_max_gap: 3
+    episode_overlap_threshold: 0.2
   keypoint_noise_std:
     back_leg_together: 0.0
     genitalia_extension: 0.01

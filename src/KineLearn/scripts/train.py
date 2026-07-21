@@ -9,7 +9,7 @@ This script:
 - optionally excludes raw absolute x/y keypoint columns from model input
 - windows train/val/test subsets into memmap-backed arrays
 - trains a keypoints-only BiLSTM with focal loss
-- checkpoints on val_loss, with optional reduce-on-plateau and early stopping
+- checkpoints on val_loss or opt-in reconstructed episode validation performance
 - evaluates the selected checkpoint on the test subset
 - writes run artifacts and a train_manifest.yml under results/<behavior>/<timestamp>/
 
@@ -20,7 +20,7 @@ per behavior or overridden at the CLI for split-specific validation tuning.
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,13 @@ from KineLearn.core.generators import KeypointWindowGenerator
 from KineLearn.core.losses import focal_loss
 from KineLearn.core.memmap import make_windowed_memmaps
 from KineLearn.core.models import build_sequence_model
+from KineLearn.scripts.eval import (
+    aggregate_member_predictions,
+    compute_episode_outputs,
+    frame_table_from_buffers,
+    populate_true_labels,
+    prepare_frame_buffers,
+)
 
 # (Optional for future training step)
 try:
@@ -273,6 +280,101 @@ def resolve_keypoint_noise_std(training_cfg: Dict, behavior: str) -> float:
     return float(noise_cfg)
 
 
+def checkpoint_thresholds(selection_cfg: dict[str, Any]) -> list[float]:
+    """Resolve an explicit, finite probability-threshold grid."""
+    threshold_cfg = selection_cfg.get("thresholds")
+    if threshold_cfg is None:
+        threshold_cfg = {"start": 0.35, "stop": 0.75, "step": 0.01}
+
+    if isinstance(threshold_cfg, (list, tuple)):
+        thresholds = [float(value) for value in threshold_cfg]
+    elif isinstance(threshold_cfg, dict):
+        start = float(threshold_cfg.get("start", 0.35))
+        stop = float(threshold_cfg.get("stop", 0.75))
+        step = float(threshold_cfg.get("step", 0.01))
+        if step <= 0:
+            raise ValueError("training.checkpoint_selection.thresholds.step must be positive.")
+        if stop < start:
+            raise ValueError(
+                "training.checkpoint_selection.thresholds.stop must be >= start."
+            )
+        count = int(np.floor((stop - start) / step + 1e-9)) + 1
+        thresholds = [start + idx * step for idx in range(count)]
+        if thresholds[-1] < stop - 1e-9:
+            thresholds.append(stop)
+    else:
+        raise ValueError(
+            "training.checkpoint_selection.thresholds must be a list or mapping."
+        )
+
+    thresholds = sorted({round(float(value), 10) for value in thresholds})
+    if not thresholds:
+        raise ValueError("training.checkpoint_selection.thresholds cannot be empty.")
+    if any(
+        not np.isfinite(value) or value <= 0.0 or value >= 1.0
+        for value in thresholds
+    ):
+        raise ValueError(
+            "Checkpoint-selection thresholds must be finite and between 0 and 1."
+        )
+    return thresholds
+
+
+def resolve_checkpoint_selection_config(training_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize opt-in episode-aware checkpoint selection settings."""
+    raw_cfg = training_cfg.get("checkpoint_selection") or {}
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("training.checkpoint_selection must be a mapping.")
+
+    cfg = dict(raw_cfg)
+    cfg.setdefault("enabled", False)
+    cfg["enabled"] = bool(cfg["enabled"])
+    cfg.setdefault("metric", "episode_f1")
+    if cfg["metric"] != "episode_f1":
+        raise ValueError(
+            "Only training.checkpoint_selection.metric: episode_f1 is currently supported."
+        )
+    cfg["thresholds"] = checkpoint_thresholds(cfg)
+    cfg.setdefault("episode_min_frames", 16)
+    cfg.setdefault("episode_max_gap", 3)
+    cfg.setdefault("episode_overlap_threshold", 0.2)
+    cfg["episode_min_frames"] = int(cfg["episode_min_frames"])
+    cfg["episode_max_gap"] = int(cfg["episode_max_gap"])
+    cfg["episode_overlap_threshold"] = float(cfg["episode_overlap_threshold"])
+    if cfg["episode_min_frames"] <= 0:
+        raise ValueError("checkpoint_selection.episode_min_frames must be positive.")
+    if cfg["episode_max_gap"] < 0:
+        raise ValueError("checkpoint_selection.episode_max_gap cannot be negative.")
+    if not 0.0 < cfg["episode_overlap_threshold"] <= 1.0:
+        raise ValueError(
+            "checkpoint_selection.episode_overlap_threshold must be in (0, 1]."
+        )
+    return cfg
+
+
+def checkpoint_candidate_rank(candidate: dict[str, Any]) -> tuple[float, ...]:
+    """Rank by episode F1, then balance, with deterministic threshold tie-breaks."""
+    precision = float(candidate["precision"])
+    recall = float(candidate["recall"])
+    threshold = float(candidate["threshold"])
+    return (
+        float(candidate["f1"]),
+        min(precision, recall),
+        precision,
+        recall,
+        -abs(threshold - 0.5),
+        -threshold,
+    )
+
+
+def select_checkpoint_candidate(
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not candidates:
+        raise ValueError("At least one checkpoint candidate is required.")
+    return max(candidates, key=checkpoint_candidate_rank)
+
+
 def align_columns(
     df: pd.DataFrame,
     expected: List[str],
@@ -341,6 +443,185 @@ class HistoryCapture(tf.keras.callbacks.Callback if tf is not None else object):
         logs = logs or {}
         for key, value in logs.items():
             self.history.setdefault(key, []).append(float(value))
+
+
+class EpisodeCheckpointSelector(tf.keras.callbacks.Callback if tf is not None else object):
+    """Select weights using reconstructed validation episode performance."""
+
+    def __init__(
+        self,
+        *,
+        mmX: np.memmap,
+        mmY: np.memmap,
+        vids: np.ndarray,
+        starts: np.ndarray,
+        behavior: str,
+        behavior_idx: int,
+        window_size: int,
+        batch_size: int,
+        selection_cfg: dict[str, Any],
+        checkpoint_path: Path,
+        output_dir: Path,
+    ) -> None:
+        if tf is None:
+            raise ImportError("TensorFlow is required for EpisodeCheckpointSelector.")
+        super().__init__()
+        self.mmX = mmX
+        self.vids = vids
+        self.starts = starts
+        self.behavior = behavior
+        self.window_size = int(window_size)
+        self.batch_size = int(batch_size)
+        self.selection_cfg = dict(selection_cfg)
+        self.thresholds = list(selection_cfg["thresholds"])
+        self.checkpoint_path = checkpoint_path
+        self.output_dir = output_dir
+        self.candidates_path = output_dir / "checkpoint_candidates.csv"
+        self.summary_path = output_dir / "checkpoint_selection_summary.yml"
+        self.predictions_path = (
+            output_dir / "checkpoint_selection_val_predictions.parquet"
+        )
+        self._base_buffers = prepare_frame_buffers(vids, starts, self.window_size)
+        populate_true_labels(
+            self._base_buffers,
+            mmY,
+            vids,
+            starts,
+            behavior_idx=int(behavior_idx),
+            window_size=self.window_size,
+            batch_size=self.batch_size,
+        )
+        self.candidate_rows: list[dict[str, Any]] = []
+        self.best_candidate: dict[str, Any] | None = None
+        self.best_frame_df: pd.DataFrame | None = None
+
+    def _fresh_buffers(self) -> dict[str, dict[str, np.ndarray]]:
+        return {
+            stem: {
+                "prob_sum": np.zeros_like(buf["prob_sum"]),
+                "count": np.zeros_like(buf["count"]),
+                "true": buf["true"].copy(),
+            }
+            for stem, buf in self._base_buffers.items()
+        }
+
+    def _write_artifacts(self) -> None:
+        best_epoch = self.best_candidate["epoch"] if self.best_candidate else None
+        best_threshold = self.best_candidate["threshold"] if self.best_candidate else None
+        rows = []
+        for row in self.candidate_rows:
+            output_row = dict(row)
+            output_row["selected_overall_so_far"] = bool(
+                row["epoch"] == best_epoch and row["threshold"] == best_threshold
+            )
+            rows.append(output_row)
+        pd.DataFrame(rows).to_csv(self.candidates_path, index=False)
+
+        summary = {
+            "enabled": True,
+            "metric": self.selection_cfg["metric"],
+            "ranking": [
+                "episode_f1",
+                "min_episode_precision_recall",
+                "episode_precision",
+                "episode_recall",
+                "threshold_closest_to_0.5",
+                "lower_threshold",
+            ],
+            "thresholds": self.thresholds,
+            "episode_min_frames": self.selection_cfg["episode_min_frames"],
+            "episode_max_gap": self.selection_cfg["episode_max_gap"],
+            "episode_overlap_threshold": self.selection_cfg[
+                "episode_overlap_threshold"
+            ],
+            "selected": dict(self.best_candidate) if self.best_candidate else None,
+            "candidates_csv": str(self.candidates_path.resolve()),
+            "validation_predictions": (
+                str(self.predictions_path.resolve())
+                if self.best_frame_df is not None
+                else None
+            ),
+        }
+        with open(self.summary_path, "w") as f:
+            yaml.safe_dump(summary, f, sort_keys=False)
+
+        if self.best_frame_df is not None:
+            self.best_frame_df.to_parquet(self.predictions_path, index=False)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None:
+            logs = {}
+        buffers = self._fresh_buffers()
+        aggregate_member_predictions(
+            self.model,
+            self.mmX,
+            self.vids,
+            self.starts,
+            buffers,
+            window_size=self.window_size,
+            batch_size=self.batch_size,
+        )
+        frame_df = frame_table_from_buffers(
+            buffers, behavior=self.behavior, threshold=self.thresholds[0]
+        )
+        probability_column = f"prob_{self.behavior}"
+        prediction_column = f"pred_{self.behavior}"
+        probabilities = frame_df[probability_column].to_numpy()
+        epoch_candidates = []
+        for threshold in self.thresholds:
+            frame_df[prediction_column] = (probabilities >= threshold).astype(np.uint8)
+            metrics, _error_rows = compute_episode_outputs(
+                frame_df,
+                behavior=self.behavior,
+                min_pred_frames=self.selection_cfg["episode_min_frames"],
+                max_gap=self.selection_cfg["episode_max_gap"],
+                overlap_threshold=self.selection_cfg["episode_overlap_threshold"],
+            )
+            candidate = {
+                "epoch": int(epoch) + 1,
+                "threshold": float(threshold),
+                "f1": float(metrics["f1"]),
+                "precision": float(metrics["precision"]),
+                "recall": float(metrics["recall"]),
+                "min_precision_recall": float(
+                    min(metrics["precision"], metrics["recall"])
+                ),
+                "tp": int(metrics["tp"]),
+                "fp": int(metrics["fp"]),
+                "fn": int(metrics["fn"]),
+                "n_predicted_episodes": int(metrics["n_predicted_episodes"]),
+                "n_true_episodes": int(metrics["n_true_episodes"]),
+            }
+            epoch_candidates.append(candidate)
+
+        epoch_best = select_checkpoint_candidate(epoch_candidates)
+        for candidate in epoch_candidates:
+            candidate["selected_for_epoch"] = candidate is epoch_best
+        self.candidate_rows.extend(epoch_candidates)
+
+        if self.best_candidate is None or checkpoint_candidate_rank(
+            epoch_best
+        ) > checkpoint_candidate_rank(self.best_candidate):
+            candidate_path = self.output_dir / ".best_model.candidate.weights.h5"
+            self.model.save_weights(str(candidate_path))
+            candidate_path.replace(self.checkpoint_path)
+            self.best_candidate = dict(epoch_best)
+            frame_df[prediction_column] = (
+                probabilities >= float(epoch_best["threshold"])
+            ).astype(np.uint8)
+            self.best_frame_df = frame_df.copy()
+
+        logs["val_selected_episode_f1"] = float(epoch_best["f1"])
+        logs["val_selected_episode_precision"] = float(epoch_best["precision"])
+        logs["val_selected_episode_recall"] = float(epoch_best["recall"])
+        logs["val_selected_threshold"] = float(epoch_best["threshold"])
+        self._write_artifacts()
+        print(
+            "\nEpisode checkpoint candidate: "
+            f"epoch={int(epoch) + 1} threshold={epoch_best['threshold']:.3f} "
+            f"F1={epoch_best['f1']:.4f} precision={epoch_best['precision']:.4f} "
+            f"recall={epoch_best['recall']:.4f}"
+        )
 
 
 # ----------------------------
@@ -479,6 +760,8 @@ def main():
     training_cfg.setdefault("model", {})
     training_cfg["model"].setdefault("variant", "bilstm")
     training_cfg.setdefault("final_zero_fill", False)
+    checkpoint_selection_cfg = resolve_checkpoint_selection_config(training_cfg)
+    training_cfg["checkpoint_selection"] = checkpoint_selection_cfg
 
     # Resolve focal params (alpha can be global or per-behavior)
     alpha, gamma = resolve_focal_params(training_cfg, behavior)
@@ -499,6 +782,7 @@ def main():
         "early_stopping_min_delta",
         "keypoint_noise_std",
         "final_zero_fill",
+        "checkpoint_selection",
     ]:
         print(f"  {k}: {training_cfg[k]}")
     if training_cfg.get("loss", "focal") == "focal":
@@ -916,16 +1200,37 @@ def main():
     ckpt_path = out / "best_model.weights.h5"
     interrupted_ckpt_path = out / "interrupted_model.weights.h5"
     history_capture = HistoryCapture()
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(ckpt_path),
-            monitor="val_loss",
-            save_best_only=True,
-            save_weights_only=True,
-        ),
-        tf.keras.callbacks.CSVLogger(str(out / "train_history.csv")),
-        history_capture,
-    ]
+    episode_selector = None
+    if checkpoint_selection_cfg["enabled"]:
+        episode_selector = EpisodeCheckpointSelector(
+            mmX=mmX_va,
+            mmY=mmY_va,
+            vids=va_vids,
+            starts=va_starts,
+            behavior=behavior,
+            behavior_idx=behavior_idx,
+            window_size=wsize,
+            batch_size=batch_size,
+            selection_cfg=checkpoint_selection_cfg,
+            checkpoint_path=ckpt_path,
+            output_dir=out,
+        )
+        callbacks = [episode_selector]
+    else:
+        callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(
+                filepath=str(ckpt_path),
+                monitor="val_loss",
+                save_best_only=True,
+                save_weights_only=True,
+            )
+        ]
+    callbacks.extend(
+        [
+            tf.keras.callbacks.CSVLogger(str(out / "train_history.csv")),
+            history_capture,
+        ]
+    )
 
     if training_cfg.get("reduce_lr", False):
         callbacks.append(
@@ -934,12 +1239,18 @@ def main():
             )
         )
     if training_cfg.get("early_stopping", False):
+        early_stopping_monitor = (
+            "val_selected_episode_f1"
+            if checkpoint_selection_cfg["enabled"]
+            else "val_loss"
+        )
         callbacks.append(
             tf.keras.callbacks.EarlyStopping(
-                monitor="val_loss",
+                monitor=early_stopping_monitor,
+                mode="max" if checkpoint_selection_cfg["enabled"] else "min",
                 patience=int(training_cfg["early_stopping_patience"]),
                 min_delta=float(training_cfg["early_stopping_min_delta"]),
-                restore_best_weights=True,
+                restore_best_weights=not checkpoint_selection_cfg["enabled"],
                 verbose=1,
             )
         )
@@ -1013,6 +1324,20 @@ def main():
         "history_csv": str((out / "train_history.csv").resolve()),
         "epochs_completed": int(len(history_data.get("loss", []))),
         "best_epoch_by_val_loss": best_epoch,
+        "checkpoint_selection": (
+            {
+                "enabled": True,
+                "metric": checkpoint_selection_cfg["metric"],
+                "selected": dict(episode_selector.best_candidate),
+                "candidates_csv": str(episode_selector.candidates_path.resolve()),
+                "summary_yml": str(episode_selector.summary_path.resolve()),
+                "validation_predictions": str(
+                    episode_selector.predictions_path.resolve()
+                ),
+            }
+            if episode_selector is not None and episode_selector.best_candidate is not None
+            else {"enabled": False}
+        ),
         "final_metrics": {k: float(v[-1]) for k, v in history_data.items() if len(v) > 0},
         "test_metrics": test_results,
     }

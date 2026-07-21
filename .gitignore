@@ -214,6 +214,7 @@ __marimo__/
 configs/*
 !configs/example_config.yaml
 !configs/drosophila_example.yaml
+!configs/drosophila_bilstm_episode_checkpoint.yaml
 features/*
 !features/.gitkeep
 results/*

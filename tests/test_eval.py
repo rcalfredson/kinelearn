@@ -32,6 +32,68 @@ class _FakeBatchModel:
 
 
 class EvalManifestTests(unittest.TestCase):
+    def test_fragmented_predictions_match_a_true_bout_only_once(self) -> None:
+        pred_bouts = [(0, 4), (6, 10)]
+        gt_bouts = [(0, 10)]
+
+        metrics = eval_script.compute_bout_level_metrics(
+            pred_bouts, gt_bouts, overlap_threshold=0.2
+        )
+        fp_bouts, fn_bouts = eval_script.identify_bout_errors(
+            pred_bouts, gt_bouts, overlap_threshold=0.2
+        )
+
+        self.assertEqual(metrics["tp"], 1)
+        self.assertEqual(metrics["fp"], 1)
+        self.assertEqual(metrics["fn"], 0)
+        self.assertEqual(metrics["precision"], 0.5)
+        self.assertEqual(metrics["recall"], 1.0)
+        self.assertEqual(len(fp_bouts), 1)
+        self.assertEqual(fn_bouts, [])
+
+    def test_matching_maximizes_one_to_one_cardinality(self) -> None:
+        # The long prediction can match either true bout, while the short
+        # prediction can match only the first. A one-pass greedy matcher could
+        # produce one TP; maximum-cardinality matching must produce two.
+        pred_bouts = [(0, 29), (0, 9)]
+        gt_bouts = [(0, 9), (20, 29)]
+
+        matches = eval_script.match_bouts_one_to_one(
+            pred_bouts, gt_bouts, overlap_threshold=0.2
+        )
+        metrics = eval_script.compute_bout_level_metrics(
+            pred_bouts, gt_bouts, overlap_threshold=0.2
+        )
+
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(metrics["tp"], 2)
+        self.assertEqual(metrics["fp"], 0)
+        self.assertEqual(metrics["fn"], 0)
+
+    def test_episode_counts_do_not_depend_on_prediction_fragmentation(self) -> None:
+        frame_df = eval_script.pd.DataFrame(
+            {
+                "__stem__": ["video_a"] * 12,
+                "__frame__": list(range(12)),
+                "true_behavior": [1] * 11 + [0],
+                "pred_behavior": [1] * 5 + [0] + [1] * 5 + [0],
+            }
+        )
+
+        metrics, _errors = eval_script.compute_episode_outputs(
+            frame_df,
+            behavior="behavior",
+            min_pred_frames=1,
+            max_gap=0,
+            overlap_threshold=0.2,
+        )
+
+        self.assertEqual(metrics["n_true_episodes"], 1)
+        self.assertEqual(metrics["n_predicted_episodes"], 2)
+        self.assertEqual(metrics["tp"], 1)
+        self.assertEqual(metrics["fp"], 1)
+        self.assertEqual(metrics["fn"], 0)
+
     def test_recusal_stems_defaults_to_train_plus_val(self) -> None:
         manifest = {
             "resolved_stems": {
