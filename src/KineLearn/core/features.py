@@ -7,6 +7,7 @@ from KineLearn.core.geometry import compute_angle, compute_distance
 
 
 RELATIONAL_FEATURE_PREFIX = "rel_"
+_CIRCULAR_RELATIONAL_SUFFIXES = {"left_signed_angle", "right_signed_angle"}
 
 
 def _normalized_vector(dx, dy, scale, *, epsilon):
@@ -100,6 +101,99 @@ def compute_bilateral_tip_features(df_xy, group_name, group_cfg, default_scale_p
     )
 
 
+def _resolve_relational_dynamics(group_name, group_cfg, available_suffixes):
+    """Validate and normalize one relational group's optional lag settings."""
+    dynamics_cfg = group_cfg.get("dynamics")
+    if dynamics_cfg is None:
+        return [], []
+    if not isinstance(dynamics_cfg, dict):
+        raise ValueError(
+            f"Relational group '{group_name}' dynamics must be a mapping."
+        )
+    if not dynamics_cfg.get("enabled", True):
+        return [], []
+
+    raw_lags = dynamics_cfg.get("lags")
+    if not isinstance(raw_lags, (list, tuple)) or not raw_lags:
+        raise ValueError(
+            f"Relational group '{group_name}' dynamics.lags must be a non-empty list."
+        )
+    lags = []
+    for lag in raw_lags:
+        if isinstance(lag, bool) or not isinstance(lag, (int, np.integer)) or lag <= 0:
+            raise ValueError(
+                f"Relational group '{group_name}' dynamics.lags must contain "
+                "positive integers."
+            )
+        lag = int(lag)
+        if lag in lags:
+            raise ValueError(
+                f"Relational group '{group_name}' dynamics.lags contains duplicate "
+                f"lag {lag}."
+            )
+        lags.append(lag)
+
+    selected_suffixes = dynamics_cfg.get("features")
+    if selected_suffixes is None:
+        selected_suffixes = list(available_suffixes)
+    if not isinstance(selected_suffixes, (list, tuple)) or not selected_suffixes:
+        raise ValueError(
+            f"Relational group '{group_name}' dynamics.features must be a "
+            "non-empty list when provided."
+        )
+    if any(not isinstance(suffix, str) for suffix in selected_suffixes):
+        raise ValueError(
+            f"Relational group '{group_name}' dynamics.features must contain strings."
+        )
+    if len(set(selected_suffixes)) != len(selected_suffixes):
+        raise ValueError(
+            f"Relational group '{group_name}' dynamics.features contains duplicates."
+        )
+    unknown = sorted(set(selected_suffixes) - set(available_suffixes))
+    if unknown:
+        raise ValueError(
+            f"Relational group '{group_name}' dynamics.features contains unknown "
+            f"features: {unknown}"
+        )
+    return lags, list(selected_suffixes)
+
+
+def compute_lagged_relational_features(static_features, group_name, group_cfg):
+    """Compute causal deltas from one group's body-centric static features."""
+    prefix = f"{RELATIONAL_FEATURE_PREFIX}{group_name}_"
+    group_columns = [
+        column for column in static_features.columns if column.startswith(prefix)
+    ]
+    available_suffixes = [column[len(prefix) :] for column in group_columns]
+    lags, selected_suffixes = _resolve_relational_dynamics(
+        group_name, group_cfg, available_suffixes
+    )
+    if not lags:
+        return pd.DataFrame(index=static_features.index)
+
+    dynamic_features = {}
+    for lag in lags:
+        for suffix in selected_suffixes:
+            column = f"{prefix}{suffix}"
+            current = static_features[column].astype(float)
+            previous = current.shift(lag)
+            delta = current - previous
+            if suffix in _CIRCULAR_RELATIONAL_SUFFIXES:
+                delta = np.arctan2(
+                    np.sin(np.pi * delta),
+                    np.cos(np.pi * delta),
+                ) / np.pi
+
+            # A missing prior frame at the start of a video means no observed
+            # change yet. Preserve NaN when the current pose itself is missing.
+            boundary = np.arange(len(current)) < lag
+            delta = pd.Series(delta, index=static_features.index, dtype=float)
+            delta.loc[boundary & current.notna().to_numpy()] = 0.0
+            dynamic_features[f"{column}_delta_lag{lag}"] = delta
+
+    return pd.DataFrame(dynamic_features, index=static_features.index)
+
+
 def compute_relational_features(df_xy, features_cfg):
     """Compute all enabled config-defined relational feature groups."""
     groups = features_cfg.get("relational", {}) or {}
@@ -110,13 +204,21 @@ def compute_relational_features(df_xy, features_cfg):
             continue
         group_type = group_cfg.get("type")
         if group_type == "bilateral_tips":
-            frames.append(
-                compute_bilateral_tip_features(
-                    df_xy,
-                    group_name,
-                    group_cfg,
-                    default_scale_pts,
-                )
+            static_features = compute_bilateral_tip_features(
+                df_xy,
+                group_name,
+                group_cfg,
+                default_scale_pts,
+            )
+            frames.extend(
+                [
+                    static_features,
+                    compute_lagged_relational_features(
+                        static_features,
+                        group_name,
+                        group_cfg,
+                    ),
+                ]
             )
         else:
             raise ValueError(

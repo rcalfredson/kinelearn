@@ -284,6 +284,44 @@ Relational groups are opt-in during training. A group with `behavior` or
 to every behavior. The worked back-leg configuration is
 `configs/drosophila_blt_static_relational.yaml`.
 
+Relational groups can also opt into causal, backward-looking changes over
+selected frame lags:
+
+```yaml
+features:
+  relational:
+    back_legs:
+      type: bilateral_tips
+      behavior: back_leg_together
+      origin: abdomen
+      axis: [thorax, abdomen]
+      left_tip: left_back_leg_tip
+      right_tip: right_back_leg_tip
+      dynamics:
+        lags: [1, 3, 5]
+        features:
+          - left_posterior
+          - left_lateral
+          - right_posterior
+          - right_lateral
+          - tip_separation
+          - midpoint_posterior
+          - midpoint_lateral
+          - mean_origin_tip_distance
+          - distance_asymmetry
+          - left_signed_angle
+          - right_signed_angle
+          - angle_asymmetry
+```
+
+Omit `dynamics.features` to derive lagged changes for every static feature in
+the group. Each output is named like
+`rel_back_legs_tip_separation_delta_lag3`. Initial frames without sufficient
+history receive a zero delta; missing source poses remain missing for the normal
+feature-imputation path. Signed-angle changes use circular wrapping across the
+`-pi`/`pi` boundary. Because only previous frames are referenced, these features
+do not leak future information.
+
 ---
 ### 4. Create a video list file
 Create a YAML file containing the list of videos you want to process.
