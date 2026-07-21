@@ -22,6 +22,7 @@ from KineLearn.core.evaluation import (
 )
 from KineLearn.scripts.batch_eval_splits import (
     completed_eval_is_reusable,
+    load_threshold_map,
     main as batch_eval_main,
     metric_aggregate_rows,
     selected_checkpoint_threshold,
@@ -80,6 +81,19 @@ class SelectedThresholdTests(unittest.TestCase):
                 ValueError, "does not have checkpoint selection enabled"
             ):
                 selected_checkpoint_threshold(manifest_path)
+
+    def test_external_threshold_map_requires_unique_valid_run_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "thresholds.csv"
+            path.write_text(
+                "outer_id,inner_seed,threshold\n"
+                "outer_seed0,0,0.4\n"
+                "outer_seed1,0,0.6\n"
+            )
+            self.assertEqual(
+                load_threshold_map(path),
+                {("outer_seed0", "0"): 0.4, ("outer_seed1", "0"): 0.6},
+            )
 
 
 class ResumeEvaluationTests(unittest.TestCase):

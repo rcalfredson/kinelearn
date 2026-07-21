@@ -661,6 +661,7 @@ Optional CLI arguments:
 - `--subset train|val|test` to choose which subset to evaluate for each run (default: `val`)
 - `--threshold` to change the frame-level decision threshold passed through to `kinelearn-eval`
 - `--use-selected-threshold` to use each run's validation-selected checkpoint threshold; this is mutually exclusive with `--threshold` and with fixed external `--manifest` sources
+- `--threshold-map` to use an external CSV keyed by `outer_id` and `inner_seed`, keeping post-hoc threshold selection distinct from checkpoint-aware training
 - `--level frame|episode|both` to request frame-level metrics, episode-level metrics, or both
 - `--episode-min-frames` to control the minimum predicted episode length
 - `--episode-max-gap` to control the allowed internal gap inside a predicted episode
@@ -668,6 +669,7 @@ Optional CLI arguments:
 - `--ensemble-recusal-policy none|train|train_val` to control abstention when evaluating ensemble sources (default: `train_val`)
 - `--batch-size` to override evaluation batch size
 - `--out-dir` to choose the output directory
+- `--manifest-root` to search additional directories for relocated or archived training manifests
 - `--resume` to reuse compatible completed runs in an existing `--out-dir` and rerun only missing or incomplete evaluations
 
 This will write:
@@ -685,6 +687,72 @@ Practical notes:
 - Selected-threshold mode validates every resolved run manifest before launching inference, so a missing or invalid recorded threshold fails before a partial batch is produced.
 - Resume mode requires the same source, subset, threshold mode, episode settings, scorer provenance, and evaluation command recorded in the existing batch configuration.
 - Episode outputs record `one_to_one_max_cardinality` matching with overlap measured as a fraction of predicted-episode length.
+
+### Selecting a post-hoc threshold map
+
+Use `kinelearn-select-threshold-map` when a historical checkpoint was selected by
+validation loss but saved validation probabilities have been rescored over a
+threshold grid. The command applies the same F1/balance tie-breaking rule used by
+checkpoint-aware training and writes one threshold per outer/inner run:
+
+```bash
+kinelearn-select-threshold-map \
+  results/baseline_remeasurement_one_to_one/per_run_threshold_metrics.csv \
+  --behavior back_leg_together \
+  --episode-matching-method one_to_one_max_cardinality \
+  --episode-overlap-denominator predicted_episode_length \
+  --out results/threshold_maps/blt_historical_validation_selected.csv
+```
+
+The resulting CSV can be supplied to batch evaluation:
+
+```bash
+kinelearn-batch-eval-splits \
+  /media/Synology4/Robert/kinelearn_experiments/split_variability/blt_nested \
+  --manifest-root /media/Synology4/Robert/kinelearn_experiments/back_leg_together \
+  --subset test \
+  --threshold-map results/threshold_maps/blt_historical_validation_selected.csv \
+  --level both \
+  --out-dir results/split_variability_evals/blt_historical_posthoc_test
+```
+
+This is recorded as `threshold_mode: external_map`, rather than
+`selected_checkpoint`, preserving the fact that the threshold was selected after
+training for an already-retained checkpoint. The configuration also records a
+SHA-256 digest of the map, and resume rejects a changed map.
+
+---
+## 📐 Comparing Split-Sweep Evaluations
+
+`kinelearn-compare-sweeps` compares two or more completed batch-evaluation
+directories. Checkpoint policy is supplied explicitly for each batch, while
+threshold policy is read from each evaluation configuration.
+
+```bash
+kinelearn-compare-sweeps \
+  --batch historical_fixed=results/split_variability_evals/blt_historical_fixed_test \
+  --checkpoint-policy historical_fixed=val_loss \
+  --batch historical_posthoc=results/split_variability_evals/blt_historical_posthoc_test \
+  --checkpoint-policy historical_posthoc=val_loss \
+  --batch new_joint=results/split_variability_evals/blt_nested_episode_checkpoint_control_test \
+  --checkpoint-policy new_joint=episode_f1 \
+  --behavior back_leg_together \
+  --out-dir results/sweep_comparisons/blt_checkpoint_and_threshold_policies
+```
+
+Before comparison, the command requires matching subsets, scorer provenance,
+run keys, and exact normalized train/test and train/validation split contents.
+Batch order determines pair direction: later batches are candidates relative to
+earlier batches.
+
+Outputs include:
+
+- `combined_metrics.csv` with explicit checkpoint and threshold policy columns
+- `batch_summary.csv` with mean, standard deviation, range, and milestone status
+- `outer_summary.csv` with inner runs summarized within each outer split
+- `paired_run_deltas.csv` with run-level F1, precision, and recall differences
+- `pairwise_summary.csv` with mean deltas and win/tie/loss counts
+- `comparison_manifest.yml` recording sources, policies, provenance, and outputs
 
 ---
 ## 📊 Evaluating Predictions

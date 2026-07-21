@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime
+import hashlib
 import math
 from pathlib import Path
 import subprocess
@@ -86,6 +87,14 @@ def parse_args() -> argparse.Namespace:
             "This is supported only when each run evaluates its own manifest."
         ),
     )
+    threshold_group.add_argument(
+        "--threshold-map",
+        default=None,
+        help=(
+            "CSV containing outer_id, inner_seed, and threshold columns. Use this "
+            "for thresholds selected independently from the training manifest."
+        ),
+    )
     parser.add_argument(
         "--level",
         choices=["frame", "episode", "both"],
@@ -126,6 +135,15 @@ def parse_args() -> argparse.Namespace:
         "--out-dir",
         default=None,
         help="Output directory. Defaults to results/split_variability_evals/<timestamp>/",
+    )
+    parser.add_argument(
+        "--manifest-root",
+        action="append",
+        default=[],
+        help=(
+            "Additional directory to search for relocated train manifests. "
+            "May be provided more than once."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -204,7 +222,11 @@ def eval_output_dir(base_out_dir: Path, *, outer_id: str, inner_seed: str) -> Pa
     return base_out_dir / "runs" / str(outer_id) / f"inner_seed{inner_seed}"
 
 
-def infer_manifest_path(run: dict[str, Any], sweep_dir: Path) -> Path | None:
+def infer_manifest_path(
+    run: dict[str, Any],
+    sweep_dir: Path,
+    manifest_roots: list[Path] | None = None,
+) -> Path | None:
     manifest_path = run.get("manifest_path")
     if manifest_path:
         path = Path(manifest_path)
@@ -216,7 +238,19 @@ def infer_manifest_path(run: dict[str, Any], sweep_dir: Path) -> Path | None:
     if not split_path or not val_split_path:
         return None
 
-    candidates = list(sweep_dir.rglob("train_manifest.yml"))
+    roots = [sweep_dir, *(manifest_roots or [])]
+    recorded_run_name = Path(manifest_path).parent.name if manifest_path else None
+    if recorded_run_name:
+        for root in roots:
+            direct = root / recorded_run_name / "train_manifest.yml"
+            if direct.exists():
+                return direct.resolve()
+
+    candidates = [
+        candidate
+        for root in roots
+        for candidate in root.rglob("train_manifest.yml")
+    ]
     for candidate in candidates:
         try:
             manifest = load_yaml(candidate)
@@ -255,6 +289,46 @@ def threshold_for_run(args: argparse.Namespace, manifest_path: Path) -> float:
     if args.use_selected_threshold:
         return selected_checkpoint_threshold(manifest_path)
     return 0.5 if args.threshold is None else float(args.threshold)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def threshold_map_metadata(path: Path) -> dict[str, Any] | None:
+    metadata_path = path.with_suffix(".yml")
+    if not metadata_path.exists():
+        return None
+    metadata = load_yaml(metadata_path)
+    recorded_map = metadata.get("threshold_map")
+    if recorded_map and Path(recorded_map).resolve() != path.resolve():
+        raise ValueError(
+            f"Threshold-map metadata {metadata_path} refers to a different CSV."
+        )
+    return metadata
+
+
+def load_threshold_map(path: Path) -> dict[tuple[str, str], float]:
+    rows = load_run_rows(path)
+    required = {"outer_id", "inner_seed", "threshold"}
+    if not required.issubset(rows[0]):
+        raise ValueError(
+            f"Threshold map {path} must contain columns {sorted(required)}."
+        )
+    thresholds: dict[tuple[str, str], float] = {}
+    for row in rows:
+        key = (str(row["outer_id"]), str(row["inner_seed"]))
+        if key in thresholds:
+            raise ValueError(f"Threshold map {path} contains duplicate run key {key}.")
+        threshold = float(row["threshold"])
+        if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+            raise ValueError(f"Threshold map {path} has invalid threshold for {key}.")
+        thresholds[key] = threshold
+    return thresholds
 
 
 def build_eval_command(
@@ -308,19 +382,44 @@ def batch_config_payload(
     sweep_dir: Path,
     table_path: Path,
 ) -> dict[str, Any]:
+    map_path = Path(args.threshold_map) if args.threshold_map else None
+    map_metadata = threshold_map_metadata(map_path) if map_path else None
     return {
         "source": str(source.resolve()),
         "sweep_dir": str(sweep_dir.resolve()),
         "table_path": str(table_path.resolve()),
         "manifests": [str(Path(p).resolve()) for p in args.manifest],
+        "manifest_roots": [str(Path(p).resolve()) for p in args.manifest_root],
         "subset": args.subset,
         "threshold_mode": (
-            "selected_checkpoint" if args.use_selected_threshold else "fixed"
+            "selected_checkpoint"
+            if args.use_selected_threshold
+            else "external_map"
+            if args.threshold_map
+            else "fixed"
         ),
         "threshold": (
             None
-            if args.use_selected_threshold
+            if args.use_selected_threshold or args.threshold_map
             else float(0.5 if args.threshold is None else args.threshold)
+        ),
+        "threshold_map": (
+            str(Path(args.threshold_map).resolve()) if args.threshold_map else None
+        ),
+        "threshold_map_sha256": (
+            file_sha256(map_path) if map_path else None
+        ),
+        "threshold_map_metadata": (
+            str(map_path.with_suffix(".yml").resolve()) if map_metadata else None
+        ),
+        "threshold_map_metadata_sha256": (
+            file_sha256(map_path.with_suffix(".yml")) if map_metadata else None
+        ),
+        "threshold_selection_episode_matching_method": (
+            map_metadata.get("episode_matching_method") if map_metadata else None
+        ),
+        "threshold_selection_episode_overlap_denominator": (
+            map_metadata.get("episode_overlap_denominator") if map_metadata else None
         ),
         "level": args.level,
         "ensemble_recusal_policy": args.ensemble_recusal_policy,
@@ -501,9 +600,26 @@ def main() -> None:
     else:
         write_yaml(config_path, config)
 
+    manifest_roots = [Path(path) for path in args.manifest_root]
+    threshold_map = (
+        load_threshold_map(Path(args.threshold_map)) if args.threshold_map else None
+    )
+    if threshold_map is not None:
+        expected_keys = {
+            (str(run.get("outer_id")), str(run.get("inner_seed")))
+            for run in run_rows
+        }
+        missing = sorted(expected_keys - set(threshold_map))
+        extra = sorted(set(threshold_map) - expected_keys)
+        if missing or extra:
+            raise ValueError(
+                "Threshold-map run coverage does not match the sweep: "
+                f"missing={missing}, extra={extra}."
+            )
+
     if args.use_selected_threshold:
         for run in run_rows:
-            manifest_path = infer_manifest_path(run, sweep_dir)
+            manifest_path = infer_manifest_path(run, sweep_dir, manifest_roots)
             if manifest_path is not None:
                 selected_checkpoint_threshold(manifest_path)
 
@@ -511,7 +627,7 @@ def main() -> None:
     for idx, run in enumerate(run_rows, start=1):
         outer_id = str(run.get("outer_id", "unknown"))
         inner_seed = str(run.get("inner_seed", "unknown"))
-        manifest_path = infer_manifest_path(run, sweep_dir)
+        manifest_path = infer_manifest_path(run, sweep_dir, manifest_roots)
 
         print(
             f"\n=== Eval {idx}/{len(run_rows)} "
@@ -535,7 +651,12 @@ def main() -> None:
             continue
 
         run_out_dir = eval_output_dir(out_dir, outer_id=outer_id, inner_seed=inner_seed)
-        threshold = threshold_for_run(args, manifest_path)
+        run_key = (outer_id, inner_seed)
+        threshold = (
+            threshold_map[run_key]
+            if threshold_map is not None
+            else threshold_for_run(args, manifest_path)
+        )
         reuse = args.resume and completed_eval_is_reusable(
             run_out_dir,
             args=args,
@@ -577,7 +698,11 @@ def main() -> None:
             "subset": args.subset,
             "threshold": float(threshold),
             "threshold_source": (
-                "checkpoint_selection" if args.use_selected_threshold else "fixed"
+                "checkpoint_selection"
+                if args.use_selected_threshold
+                else "external_map"
+                if threshold_map is not None
+                else "fixed"
             ),
             "level_requested": args.level,
         }
