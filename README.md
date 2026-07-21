@@ -615,8 +615,10 @@ It is intended for the common follow-up step after `kinelearn-split-variability 
 It performs:
 1. **Resolving the sweep source** — accepts a split-variability output directory, `results_summary.csv`, or `experiment_plan.csv`.
 2. **Finding manifests for each run** — uses `manifest_path` when present, or infers manifests from saved split metadata.
-3. **Running evaluation per run** — invokes `kinelearn-eval` with consistent subset, threshold, and reporting settings.
-4. **Aggregating metrics** — writes one combined CSV summarizing metrics across the whole sweep.
+3. **Resolving thresholds** — uses one fixed threshold for every run by default, or each run's validation-selected checkpoint threshold when requested.
+4. **Running evaluation per run** — invokes `kinelearn-eval` with consistent subset and reporting settings.
+5. **Aggregating metrics** — writes raw per-run results, overall metric summaries, and per-outer-split summaries.
+6. **Resuming safely** — when requested, reuses only complete per-run outputs whose recorded settings match the current evaluation.
 
 Example command:
 
@@ -639,10 +641,26 @@ kinelearn-batch-eval-splits \
   --level both
 ```
 
+Evaluate each model on its held-out outer test subset using the threshold selected
+from that model's validation data:
+
+```bash
+kinelearn-batch-eval-splits \
+  results/split_variability/blt_nested_episode_checkpoint_control \
+  --subset test \
+  --use-selected-threshold \
+  --level both \
+  --episode-min-frames 16 \
+  --episode-max-gap 3 \
+  --episode-overlap-threshold 0.2 \
+  --out-dir results/split_variability_evals/blt_nested_episode_checkpoint_control_test
+```
+
 Optional CLI arguments:
 - `--manifest` to score a fixed source, such as an ensemble manifest, across every run in the sweep
 - `--subset train|val|test` to choose which subset to evaluate for each run (default: `val`)
 - `--threshold` to change the frame-level decision threshold passed through to `kinelearn-eval`
+- `--use-selected-threshold` to use each run's validation-selected checkpoint threshold; this is mutually exclusive with `--threshold` and with fixed external `--manifest` sources
 - `--level frame|episode|both` to request frame-level metrics, episode-level metrics, or both
 - `--episode-min-frames` to control the minimum predicted episode length
 - `--episode-max-gap` to control the allowed internal gap inside a predicted episode
@@ -650,10 +668,13 @@ Optional CLI arguments:
 - `--ensemble-recusal-policy none|train|train_val` to control abstention when evaluating ensemble sources (default: `train_val`)
 - `--batch-size` to override evaluation batch size
 - `--out-dir` to choose the output directory
+- `--resume` to reuse compatible completed runs in an existing `--out-dir` and rerun only missing or incomplete evaluations
 
 This will write:
 - `results/split_variability_evals/<timestamp>/batch_eval_config.yml`
 - `results/split_variability_evals/<timestamp>/batch_eval_summary.csv`
+- `results/split_variability_evals/<timestamp>/batch_eval_aggregate.csv`
+- `results/split_variability_evals/<timestamp>/batch_eval_outer_summary.csv`
 - per-run evaluation outputs under `results/split_variability_evals/<timestamp>/runs/<outer_id>/inner_seed<seed>/`
 
 Practical notes:
@@ -661,6 +682,9 @@ Practical notes:
 - If manifests are missing from the sweep table, the command attempts to infer them by matching `split_path` and `val_split_path`.
 - Failed or unresolved runs are kept in the summary CSV with an error field instead of being silently dropped.
 - When one or more `--manifest` values are provided, `kinelearn-batch-eval-splits` evaluates those fixed source manifests against each run's resolved train manifest via `kinelearn-eval --eval-manifest`.
+- Selected-threshold mode validates every resolved run manifest before launching inference, so a missing or invalid recorded threshold fails before a partial batch is produced.
+- Resume mode requires the same source, subset, threshold mode, episode settings, scorer provenance, and evaluation command recorded in the existing batch configuration.
+- Episode outputs record `one_to_one_max_cardinality` matching with overlap measured as a fraction of predicted-episode length.
 
 ---
 ## 📊 Evaluating Predictions

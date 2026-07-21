@@ -46,6 +46,12 @@ class EvalManifestTests(unittest.TestCase):
         self.assertEqual(metrics["tp"], 1)
         self.assertEqual(metrics["fp"], 1)
         self.assertEqual(metrics["fn"], 0)
+        self.assertEqual(
+            metrics["episode_matching_method"], "one_to_one_max_cardinality"
+        )
+        self.assertEqual(
+            metrics["episode_overlap_denominator"], "predicted_episode_length"
+        )
         self.assertEqual(metrics["precision"], 0.5)
         self.assertEqual(metrics["recall"], 1.0)
         self.assertEqual(len(fp_bouts), 1)

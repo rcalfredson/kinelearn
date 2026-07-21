@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +16,11 @@ from typing import Any
 
 import pandas as pd
 import yaml
+
+from KineLearn.core.evaluation import (
+    EPISODE_MATCHING_METHOD,
+    EPISODE_OVERLAP_DENOMINATOR,
+)
 
 
 def load_yaml(path: Path) -> Any:
@@ -62,11 +68,23 @@ def parse_args() -> argparse.Namespace:
         default="val",
         help="Subset to evaluate (default: val).",
     )
-    parser.add_argument(
+    threshold_group = parser.add_mutually_exclusive_group()
+    threshold_group.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="Probability threshold to pass to kinelearn-eval (default: 0.5).",
+        default=None,
+        help=(
+            "Fixed probability threshold to pass to every evaluation "
+            "(default: 0.5 unless --use-selected-threshold is set)."
+        ),
+    )
+    threshold_group.add_argument(
+        "--use-selected-threshold",
+        action="store_true",
+        help=(
+            "Use each run manifest's validation-selected checkpoint threshold. "
+            "This is supported only when each run evaluates its own manifest."
+        ),
     )
     parser.add_argument(
         "--level",
@@ -108,6 +126,14 @@ def parse_args() -> argparse.Namespace:
         "--out-dir",
         default=None,
         help="Output directory. Defaults to results/split_variability_evals/<timestamp>/",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a compatible evaluation in --out-dir, reusing only complete "
+            "per-run outputs and rerunning missing or incomplete runs."
+        ),
     )
     return parser.parse_args()
 
@@ -204,11 +230,39 @@ def infer_manifest_path(run: dict[str, Any], sweep_dir: Path) -> Path | None:
     return None
 
 
+def selected_checkpoint_threshold(manifest_path: Path) -> float:
+    manifest = load_yaml(manifest_path)
+    selection = (manifest.get("training_run") or {}).get("checkpoint_selection") or {}
+    if selection.get("enabled") is not True:
+        raise ValueError(
+            f"Manifest {manifest_path} does not have checkpoint selection enabled."
+        )
+    selected = selection.get("selected") or {}
+    value = selected.get("threshold")
+    if value is None:
+        raise ValueError(
+            f"Manifest {manifest_path} has no validation-selected checkpoint threshold."
+        )
+    threshold = float(value)
+    if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+        raise ValueError(
+            f"Manifest {manifest_path} records an invalid selected threshold: {value!r}."
+        )
+    return threshold
+
+
+def threshold_for_run(args: argparse.Namespace, manifest_path: Path) -> float:
+    if args.use_selected_threshold:
+        return selected_checkpoint_threshold(manifest_path)
+    return 0.5 if args.threshold is None else float(args.threshold)
+
+
 def build_eval_command(
     args: argparse.Namespace,
     *,
     manifest_path: Path,
     out_dir: Path,
+    threshold: float,
 ) -> list[str]:
     command = [args.eval_command]
     if args.manifest:
@@ -223,7 +277,7 @@ def build_eval_command(
             "--subset",
             args.subset,
             "--threshold",
-            str(args.threshold),
+            str(threshold),
             "--level",
             args.level,
             "--episode-min-frames",
@@ -247,40 +301,211 @@ def load_metrics_rows(metrics_path: Path) -> list[dict[str, Any]]:
     return pd.read_csv(metrics_path).to_dict(orient="records")
 
 
+def batch_config_payload(
+    args: argparse.Namespace,
+    *,
+    source: Path,
+    sweep_dir: Path,
+    table_path: Path,
+) -> dict[str, Any]:
+    return {
+        "source": str(source.resolve()),
+        "sweep_dir": str(sweep_dir.resolve()),
+        "table_path": str(table_path.resolve()),
+        "manifests": [str(Path(p).resolve()) for p in args.manifest],
+        "subset": args.subset,
+        "threshold_mode": (
+            "selected_checkpoint" if args.use_selected_threshold else "fixed"
+        ),
+        "threshold": (
+            None
+            if args.use_selected_threshold
+            else float(0.5 if args.threshold is None else args.threshold)
+        ),
+        "level": args.level,
+        "ensemble_recusal_policy": args.ensemble_recusal_policy,
+        "episode_min_frames": int(args.episode_min_frames),
+        "episode_max_gap": int(args.episode_max_gap),
+        "episode_overlap_threshold": float(args.episode_overlap_threshold),
+        "episode_matching_method": EPISODE_MATCHING_METHOD,
+        "episode_overlap_denominator": EPISODE_OVERLAP_DENOMINATOR,
+        "batch_size": args.batch_size,
+        "eval_command": args.eval_command,
+    }
+
+
+def validate_resume_config(config_path: Path, expected: dict[str, Any]) -> None:
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Cannot resume: evaluation config not found at {config_path}."
+        )
+    recorded = load_yaml(config_path)
+    if recorded != expected:
+        raise ValueError(
+            "Cannot resume because the requested evaluation settings differ from "
+            f"those recorded in {config_path}."
+        )
+
+
+def completed_eval_is_reusable(
+    run_out_dir: Path,
+    *,
+    args: argparse.Namespace,
+    manifest_path: Path,
+    threshold: float,
+) -> bool:
+    required = [
+        run_out_dir / "eval_summary.yml",
+        run_out_dir / "per_behavior_metrics.csv",
+        run_out_dir / "frame_predictions.parquet",
+    ]
+    if args.level in {"episode", "both"}:
+        required.append(run_out_dir / "episode_errors.csv")
+    if not all(path.exists() for path in required):
+        return False
+
+    try:
+        summary = load_yaml(run_out_dir / "eval_summary.yml")
+        expected_sources = (
+            [str(Path(path).resolve()) for path in args.manifest]
+            if args.manifest
+            else [str(manifest_path.resolve())]
+        )
+        expected_eval_manifest = (
+            str(manifest_path.resolve()) if args.manifest else None
+        )
+        episode_settings = summary.get("episode_settings") or {}
+        return bool(
+            summary.get("subset") == args.subset
+            and summary.get("level") == args.level
+            and math.isclose(
+                float(summary.get("threshold")), threshold, abs_tol=1e-12
+            )
+            and summary.get("manifests") == expected_sources
+            and summary.get("evaluation_manifest") == expected_eval_manifest
+            and episode_settings.get("min_pred_frames") == args.episode_min_frames
+            and episode_settings.get("max_gap") == args.episode_max_gap
+            and math.isclose(
+                float(episode_settings.get("overlap_threshold")),
+                args.episode_overlap_threshold,
+                abs_tol=1e-12,
+            )
+            and episode_settings.get("matching_method")
+            == EPISODE_MATCHING_METHOD
+            and episode_settings.get("overlap_denominator")
+            == EPISODE_OVERLAP_DENOMINATOR
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def metric_aggregate_rows(
+    summary_rows: list[dict[str, Any]], *, by_outer: bool
+) -> list[dict[str, Any]]:
+    successful = [
+        row
+        for row in summary_rows
+        if row.get("eval_returncode") == 0
+        and not row.get("error")
+        and all(metric in row for metric in ("f1", "precision", "recall"))
+    ]
+    if not successful:
+        return []
+
+    frame = pd.DataFrame(successful)
+    group_columns = ["behavior", "subset", "level"]
+    if by_outer:
+        group_columns = ["outer_id", "outer_seed", *group_columns]
+
+    output_rows: list[dict[str, Any]] = []
+    for keys, group in frame.groupby(group_columns, dropna=False, sort=True):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = dict(zip(group_columns, keys))
+        row["n_runs"] = int(len(group))
+        for metric in ("f1", "precision", "recall", "threshold"):
+            values = pd.to_numeric(group[metric], errors="coerce").dropna()
+            if values.empty:
+                continue
+            row[f"mean_{metric}"] = float(values.mean())
+            row[f"std_{metric}"] = (
+                float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            )
+            row[f"min_{metric}"] = float(values.min())
+            row[f"max_{metric}"] = float(values.max())
+        meets = (
+            (pd.to_numeric(group["f1"], errors="coerce") >= 0.8)
+            & (pd.to_numeric(group["precision"], errors="coerce") >= 0.8)
+            & (pd.to_numeric(group["recall"], errors="coerce") >= 0.8)
+        )
+        row["n_runs_all_metrics_ge_0_80"] = int(meets.sum())
+        row["fraction_runs_all_metrics_ge_0_80"] = float(meets.mean())
+        row["all_metric_means_ge_0_80"] = bool(
+            all(
+                row.get(f"mean_{metric}", 0.0) >= 0.8
+                for metric in ("f1", "precision", "recall")
+            )
+        )
+        output_rows.append(row)
+    return output_rows
+
+
+def write_batch_reports(out_dir: Path, summary_rows: list[dict[str, Any]]) -> None:
+    aggregate_csv(out_dir / "batch_eval_summary.csv", summary_rows)
+    aggregate_csv(
+        out_dir / "batch_eval_aggregate.csv",
+        metric_aggregate_rows(summary_rows, by_outer=False),
+    )
+    aggregate_csv(
+        out_dir / "batch_eval_outer_summary.csv",
+        metric_aggregate_rows(summary_rows, by_outer=True),
+    )
+
+
 def main() -> None:
     args = parse_args()
-    if not (0.0 < args.threshold < 1.0):
+    fixed_threshold = 0.5 if args.threshold is None else float(args.threshold)
+    if not args.use_selected_threshold and not (0.0 < fixed_threshold < 1.0):
         raise ValueError("--threshold must be between 0 and 1.")
+    if args.use_selected_threshold and args.manifest:
+        raise ValueError(
+            "--use-selected-threshold cannot be combined with --manifest because "
+            "external prediction sources do not have a per-target-run threshold."
+        )
     if not (0.0 < args.episode_overlap_threshold <= 1.0):
         raise ValueError("--episode-overlap-threshold must be in (0, 1].")
+    if args.episode_min_frames <= 0:
+        raise ValueError("--episode-min-frames must be positive.")
+    if args.episode_max_gap < 0:
+        raise ValueError("--episode-max-gap must be non-negative.")
     if args.batch_size is not None and args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
+    if args.resume and not args.out_dir:
+        raise ValueError("--resume requires an explicit --out-dir.")
 
     source = Path(args.source)
     sweep_dir, table_path = resolve_source(source)
     run_rows = discover_runs(table_path)
 
     out_dir = Path(args.out_dir) if args.out_dir else default_out_dir()
+    if args.resume and not out_dir.is_dir():
+        raise FileNotFoundError(f"Cannot resume: output directory not found: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    write_yaml(
-        out_dir / "batch_eval_config.yml",
-        {
-            "source": str(source.resolve()),
-            "sweep_dir": str(sweep_dir.resolve()),
-            "table_path": str(table_path.resolve()),
-            "manifests": [str(Path(p).resolve()) for p in args.manifest],
-            "subset": args.subset,
-            "threshold": float(args.threshold),
-            "level": args.level,
-            "ensemble_recusal_policy": args.ensemble_recusal_policy,
-            "episode_min_frames": int(args.episode_min_frames),
-            "episode_max_gap": int(args.episode_max_gap),
-            "episode_overlap_threshold": float(args.episode_overlap_threshold),
-            "batch_size": args.batch_size,
-            "eval_command": args.eval_command,
-        },
+    config = batch_config_payload(
+        args, source=source, sweep_dir=sweep_dir, table_path=table_path
     )
+    config_path = out_dir / "batch_eval_config.yml"
+    if args.resume:
+        validate_resume_config(config_path, config)
+    else:
+        write_yaml(config_path, config)
+
+    if args.use_selected_threshold:
+        for run in run_rows:
+            manifest_path = infer_manifest_path(run, sweep_dir)
+            if manifest_path is not None:
+                selected_checkpoint_threshold(manifest_path)
 
     summary_rows: list[dict[str, Any]] = []
     for idx, run in enumerate(run_rows, start=1):
@@ -305,22 +530,39 @@ def main() -> None:
                 "error": "Could not resolve manifest path for run.",
             }
             summary_rows.append(row)
-            aggregate_csv(out_dir / "batch_eval_summary.csv", summary_rows)
+            write_batch_reports(out_dir, summary_rows)
             print("⚠️  Could not resolve manifest path; skipping.")
             continue
 
         run_out_dir = eval_output_dir(out_dir, outer_id=outer_id, inner_seed=inner_seed)
-        command = build_eval_command(args, manifest_path=manifest_path, out_dir=run_out_dir)
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
+        threshold = threshold_for_run(args, manifest_path)
+        reuse = args.resume and completed_eval_is_reusable(
+            run_out_dir,
+            args=args,
+            manifest_path=manifest_path,
+            threshold=threshold,
         )
-        if completed.stdout:
-            print(completed.stdout, end="")
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="")
+        if reuse:
+            print("↪️  Reusing completed evaluation artifacts.")
+            returncode = 0
+        else:
+            command = build_eval_command(
+                args,
+                manifest_path=manifest_path,
+                out_dir=run_out_dir,
+                threshold=threshold,
+            )
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if completed.stdout:
+                print(completed.stdout, end="")
+            if completed.stderr:
+                print(completed.stderr, file=sys.stderr, end="")
+            returncode = int(completed.returncode)
 
         base_row = {
             "outer_id": run.get("outer_id"),
@@ -329,18 +571,22 @@ def main() -> None:
             "split_path": run.get("split_path"),
             "val_split_path": run.get("val_split_path"),
             "manifest_path": str(manifest_path.resolve()),
-            "eval_returncode": int(completed.returncode),
+            "eval_returncode": returncode,
+            "evaluation_status": "reused" if reuse else "executed",
             "eval_out_dir": str(run_out_dir.resolve()),
             "subset": args.subset,
-            "threshold": float(args.threshold),
+            "threshold": float(threshold),
+            "threshold_source": (
+                "checkpoint_selection" if args.use_selected_threshold else "fixed"
+            ),
             "level_requested": args.level,
         }
 
-        if completed.returncode != 0:
+        if returncode != 0:
             row = dict(base_row)
             row["error"] = "kinelearn-eval returned non-zero exit status."
             summary_rows.append(row)
-            aggregate_csv(out_dir / "batch_eval_summary.csv", summary_rows)
+            write_batch_reports(out_dir, summary_rows)
             continue
 
         metrics_path = run_out_dir / "per_behavior_metrics.csv"
@@ -350,7 +596,7 @@ def main() -> None:
             row = dict(base_row)
             row["error"] = str(exc)
             summary_rows.append(row)
-            aggregate_csv(out_dir / "batch_eval_summary.csv", summary_rows)
+            write_batch_reports(out_dir, summary_rows)
             continue
 
         for metric_row in metric_rows:
@@ -358,9 +604,11 @@ def main() -> None:
             row.update(metric_row)
             summary_rows.append(row)
 
-        aggregate_csv(out_dir / "batch_eval_summary.csv", summary_rows)
+        write_batch_reports(out_dir, summary_rows)
 
     print(f"\n📝 Wrote {out_dir / 'batch_eval_summary.csv'}")
+    print(f"📝 Wrote {out_dir / 'batch_eval_aggregate.csv'}")
+    print(f"📝 Wrote {out_dir / 'batch_eval_outer_summary.csv'}")
 
 
 if __name__ == "__main__":

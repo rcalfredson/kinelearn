@@ -15,6 +15,10 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from KineLearn.core.evaluation import (
+    EPISODE_MATCHING_METHOD,
+    EPISODE_OVERLAP_DENOMINATOR,
+)
 from KineLearn.core.manifests import (
     load_prediction_source,
     load_train_manifest,
@@ -314,6 +318,8 @@ def compute_bout_level_metrics(
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
+        "episode_matching_method": EPISODE_MATCHING_METHOD,
+        "episode_overlap_denominator": EPISODE_OVERLAP_DENOMINATOR,
     }
 
 
@@ -462,6 +468,8 @@ def compute_episode_outputs(
         "f1": float(f1),
         "n_predicted_episodes": int(total_tp + total_fp),
         "n_true_episodes": int(total_tp + total_fn),
+        "episode_matching_method": EPISODE_MATCHING_METHOD,
+        "episode_overlap_denominator": EPISODE_OVERLAP_DENOMINATOR,
     }
     return episode_metrics, error_rows
 
@@ -713,6 +721,8 @@ def build_summary(
             "min_pred_frames": int(episode_min_frames),
             "max_gap": int(episode_max_gap),
             "overlap_threshold": float(episode_overlap_threshold),
+            "matching_method": EPISODE_MATCHING_METHOD,
+            "overlap_denominator": EPISODE_OVERLAP_DENOMINATOR,
         },
         "out_dir": str(out_dir.resolve()),
         "kl_config": eval_manifest.get("kl_config") if eval_manifest is not None else None,
