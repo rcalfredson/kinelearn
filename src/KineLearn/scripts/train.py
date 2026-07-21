@@ -27,6 +27,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import yaml
 
+from KineLearn.core.features import select_behavior_feature_columns
 from KineLearn.core.generators import KeypointWindowGenerator
 from KineLearn.core.losses import focal_loss
 from KineLearn.core.memmap import make_windowed_memmaps
@@ -938,6 +939,20 @@ def main():
     all_feature_columns = [
         c for c in X_train.columns if c not in ("__stem__", "__frame__")
     ]
+    behavior_feature_columns = select_behavior_feature_columns(
+        all_feature_columns,
+        kl_config.get("features") or {},
+        behavior,
+    )
+    excluded_relational_columns = sorted(
+        set(all_feature_columns) - set(behavior_feature_columns)
+    )
+    if excluded_relational_columns:
+        print(
+            f"Excluding {len(excluded_relational_columns)} relational feature columns "
+            f"not assigned to behavior '{behavior}'."
+        )
+    all_feature_columns = behavior_feature_columns
     include_absolute_coordinates = bool(
         training_cfg["include_absolute_coordinates"]
     )

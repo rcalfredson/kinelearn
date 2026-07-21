@@ -39,7 +39,6 @@ features:
 scalers:
   acceleration: scalers/scaler_drosophila_acceleration.pkl
   angles: scalers/scaler_drosophila_angles.pkl
-  coordinates: scalers/scaler_drosophila_coordinates.pkl
   distances: scalers/scaler_drosophila_distances.pkl
   velocity: scalers/scaler_drosophila_velocity.pkl
 

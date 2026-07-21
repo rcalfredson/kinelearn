@@ -1,6 +1,5 @@
 behaviors:
 - back_leg_together
-- genitalia_extension
 dlc_config: /home/tracking/ml_data/drosophila-wheel-robert-2025-10-06/config.yaml
 features:
   angles:
@@ -56,6 +55,17 @@ features:
   - - thorax
     - right_wing_tip
   ref_pt: thorax
+  relational:
+    back_legs:
+      type: bilateral_tips
+      behavior: back_leg_together
+      origin: abdomen
+      axis:
+      - thorax
+      - abdomen
+      left_tip: left_back_leg_tip
+      right_tip: right_back_leg_tip
+      epsilon: 1.0e-08
 scalers:
   acceleration: scalers/scaler_drosophila_acceleration.pkl
   angles: scalers/scaler_drosophila_angles.pkl
@@ -95,5 +105,4 @@ training:
   focal:
     alpha:
       back_leg_together: 0.64
-      genitalia_extension: 0.67
     gamma: 2.0

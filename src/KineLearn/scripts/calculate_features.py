@@ -24,13 +24,41 @@ training_features_dict = {
     "distances": [],
 }
 
-prefix_map = {
-    "coordinates": "coord_",
-    "velocity": "velocity_",
-    "acceleration": "acceleration_",
-    "angles": "angle_",
-    "distances": "distance_",
+FEATURE_FAMILY_PATTERNS = {
+    "coordinates": r"_coord_[xy]$",
+    "velocity": r"_velocity_[xy]$",
+    "acceleration": r"_acceleration_[xy]$",
+    "angles": r"^angle_",
+    "distances": r"^distance_",
 }
+
+SCALED_FEATURE_TYPES = ("velocity", "acceleration", "angles", "distances")
+
+
+def select_feature_family(df, feature_type):
+    """Select one legacy feature family without matching relational names."""
+    return df.filter(regex=FEATURE_FAMILY_PATTERNS[feature_type])
+
+
+def load_configured_scalers(kl_config):
+    """Load only feature families that are actually standardized."""
+    if "scalers" not in kl_config:
+        raise ValueError(
+            "No scalers defined in config and --create-scalers not set. "
+            "Run with --create-scalers first."
+        )
+
+    scalers = {}
+    for ft in SCALED_FEATURE_TYPES:
+        path_str = kl_config["scalers"].get(ft)
+        if path_str is None:
+            raise ValueError(f"No scaler configured for feature type: {ft}")
+        path = Path(path_str)
+        if not path.exists():
+            raise FileNotFoundError(f"Scaler file not found: {path}")
+        scalers[ft] = joblib.load(path)
+        print(f"Loaded existing scaler for {ft}: {path}")
+    return scalers
 
 
 def main():
@@ -73,6 +101,10 @@ def main():
     # Load KineLearn config
     with open(args.kl_config, "r") as f:
         kl_config = yaml.safe_load(f)
+
+    # Validate existing scaler configuration before doing the expensive
+    # per-video extraction pass.
+    scalers = None if args.create_scalers else load_configured_scalers(kl_config)
 
     # Load DLC config
     if not "dlc_config" in kl_config:
@@ -132,10 +164,8 @@ def main():
         print(f"Features written: {features_csv}")
 
         # Accumulate for potential scaler fitting
-        for ft, prefix in prefix_map.items():
-            if prefix == "":
-                continue
-            training_features_dict[ft].append(df_combined.filter(like=prefix))
+        for ft in FEATURE_FAMILY_PATTERNS:
+            training_features_dict[ft].append(select_feature_family(df_combined, ft))
 
     if args.create_scalers:
         print("\nFitting new scalers...")
@@ -144,13 +174,9 @@ def main():
 
         config_stem = Path(args.kl_config).stem
 
-        for ft, df_list in training_features_dict.items():
+        for ft in SCALED_FEATURE_TYPES:
+            df_list = training_features_dict[ft]
             if not df_list:
-                continue
-            if ft == "coordinates":
-                print(
-                    f"Skipping scaler for '{ft}' (relative coordinates are already normalized)"
-                )
                 continue
             all_data = pd.concat(df_list, ignore_index=True)
             scaler = StandardScaler().fit(all_data)
@@ -166,22 +192,6 @@ def main():
         with open(args.kl_config, "w") as f:
             yaml.safe_dump(kl_config, f)
         print(f"Updated KineLearn config with scaler paths: {args.kl_config}")
-    else:
-        # Load existing scalers
-        if "scalers" not in kl_config:
-            raise ValueError(
-                "No scalers defined in config and --create-scalers not set. "
-                "Run with --create-scalers first."
-            )
-
-        scalers = {}
-        for ft, path_str in kl_config["scalers"].items():
-            path = Path(path_str)
-            if not path.exists():
-                raise FileNotFoundError(f"Scaler file not found: {path}")
-            scalers[ft] = joblib.load(path)
-            print(f"Loaded existing scaler for {ft}: {path}")
-
     # Export scaled per-frame features and labels
     print("\nExporting scaled per-frame features and labels...")
 
@@ -203,7 +213,7 @@ def main():
         df_combined, df_xy, df_p = extract_features(dlc_file, kl_config)
         parts = [df_combined[df_xy.columns]]  # absolute coordinates (unscaled)
         for ft in ["coordinates", "velocity", "acceleration", "angles", "distances"]:
-            sel = df_combined.filter(like=prefix_map[ft])
+            sel = select_feature_family(df_combined, ft)
             if sel.empty:
                 continue
             if ft == "coordinates":
@@ -213,6 +223,11 @@ def main():
             if not sel.empty:
                 scaled = scalers[ft].transform(sel)
                 parts.append(pd.DataFrame(scaled, columns=sel.columns))
+        # Relational features are dimensionless body-centric quantities and are
+        # intentionally retained on their natural scale.
+        relational = df_combined.filter(regex=r"^rel_")
+        if not relational.empty:
+            parts.append(relational.copy())
         parts.append(df_p.copy())
 
         df_scaled = pd.concat(parts, axis=1)

@@ -215,8 +215,10 @@ configs/*
 !configs/example_config.yaml
 !configs/drosophila_example.yaml
 !configs/drosophila_bilstm_episode_checkpoint.yaml
+!configs/drosophila_blt_static_relational.yaml
 features/*
 !features/.gitkeep
+features_blt_static_relational/
 results/*
 !results/*.gitkeep
 scalers/*

@@ -191,6 +191,8 @@ This YAML file defines:
   - `body_length_pts`: A pair of keypoints defining body length (used to normalize relative coordinates).  
   - `distances`: Pairs of keypoints for distance features.  
   - `angles`: Triplets of keypoints for angle features.
+  - optional `relational` groups for normalized body-centric geometry assigned to
+    specific behaviors
 - `training`:
   - training hyperparameters such as `epochs`, `batch_size`, `learning_rate`, and focal-loss settings
   - whether raw absolute keypoint coordinates are included in model input via `include_absolute_coordinates`
@@ -246,6 +248,41 @@ training:
 ```
 
 Set `training.final_zero_fill: true` to apply one final `fillna(0)` pass after loading the per-video feature files and before windowing, which mirrors the old validation/training pipeline's last-stage NaN cleanup.
+
+### Static bilateral relational features
+
+The `bilateral_tips` relational type describes a tracked left/right pair in a
+body-centric coordinate system. For example, the back-leg grooming experiment
+uses:
+
+```yaml
+features:
+  body_length_pts: [head, thorax]
+  relational:
+    back_legs:
+      type: bilateral_tips
+      behavior: back_leg_together
+      origin: abdomen
+      axis: [thorax, abdomen]
+      left_tip: left_back_leg_tip
+      right_tip: right_back_leg_tip
+```
+
+This produces normalized posterior/lateral coordinates for both tips, normalized
+tip separation, the two-tip midpoint, mean origin-to-tip distance, distance
+asymmetry, signed body-axis angles, and wrapped angle asymmetry. Signed angles
+are divided by pi, while angle asymmetry ranges from zero when the two projected
+angles agree to one for maximal disagreement. These dimensionless features
+are retained on their natural scale rather than passed through a fitted scaler.
+The same is true of legacy relative coordinates: subtracting the configured
+reference point and dividing by body length already puts them in body-length
+units. Fitted scalers are required only for velocity, acceleration, angle, and
+distance feature families.
+
+Relational groups are opt-in during training. A group with `behavior` or
+`behaviors` is used only by the named behavior; legacy features remain available
+to every behavior. The worked back-leg configuration is
+`configs/drosophila_blt_static_relational.yaml`.
 
 ---
 ### 4. Create a video list file
