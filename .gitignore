@@ -218,6 +218,7 @@ configs/*
 !configs/drosophila_blt_static_relational.yaml
 !configs/drosophila_blt_static_relational_spe*.yaml
 !configs/drosophila_blt_dynamic_relational.yaml
+!configs/drosophila_blt_static_relational_residual_tcn.yaml
 features/*
 !features/.gitkeep
 features_blt_static_relational/

@@ -1,0 +1,117 @@
+behaviors:
+- back_leg_together
+dlc_config: /home/tracking/ml_data/drosophila-wheel-robert-2025-10-06/config.yaml
+features:
+  angles:
+  - - head
+    - thorax
+    - abdomen
+  - - thorax
+    - abdomen
+    - abdomen_tip
+  - - thorax
+    - abdomen
+    - genitalia_tip
+  - - thorax
+    - left_wing_tip
+    - abdomen
+  - - thorax
+    - right_wing_tip
+    - abdomen
+  - - head
+    - left_front_leg_tip
+    - thorax
+  - - head
+    - right_front_leg_tip
+    - thorax
+  - - abdomen
+    - left_back_leg_tip
+    - thorax
+  - - abdomen
+    - right_back_leg_tip
+    - thorax
+  body_length_pts:
+  - head
+  - thorax
+  distances:
+  - - head
+    - thorax
+  - - thorax
+    - abdomen
+  - - thorax
+    - genitalia_tip
+  - - abdomen
+    - abdomen_tip
+  - - head
+    - left_front_leg_tip
+  - - head
+    - right_front_leg_tip
+  - - abdomen
+    - left_back_leg_tip
+  - - abdomen
+    - right_back_leg_tip
+  - - thorax
+    - left_wing_tip
+  - - thorax
+    - right_wing_tip
+  ref_pt: thorax
+  relational:
+    back_legs:
+      type: bilateral_tips
+      behavior: back_leg_together
+      origin: abdomen
+      axis:
+      - thorax
+      - abdomen
+      left_tip: left_back_leg_tip
+      right_tip: right_back_leg_tip
+      epsilon: 1.0e-08
+scalers:
+  acceleration: scalers/scaler_drosophila_acceleration.pkl
+  angles: scalers/scaler_drosophila_angles.pkl
+  distances: scalers/scaler_drosophila_distances.pkl
+  velocity: scalers/scaler_drosophila_velocity.pkl
+
+window:
+  size: 60
+  stride: 10
+
+training:
+  batch_size: 8
+  steps_per_execution: 32
+  inference_batch_size: 128
+  epochs: 15
+  learning_rate: 0.001
+  include_absolute_coordinates: false
+  loss: focal
+  val_fraction: 0.1
+  seed: 100
+  reduce_lr: true
+  early_stopping: true
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.0
+  keypoint_noise_std: 0.01
+  final_zero_fill: false
+  model:
+    variant: residual_tcn
+    residual_tcn:
+      channels: 64
+      kernel_size: 3
+      dilations: [1, 2, 4, 8]
+      convolutions_per_block: 2
+      dropout: 0.30
+      activation: relu
+  checkpoint_selection:
+    enabled: true
+    metric: episode_f1
+    thresholds:
+      start: 0.35
+      stop: 0.75
+      step: 0.01
+    episode_min_frames: 16
+    episode_max_gap: 3
+    episode_overlap_threshold: 0.2
+  focal:
+    alpha:
+      back_leg_together: 0.64
+    gamma: 2.0

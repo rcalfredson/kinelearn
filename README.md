@@ -197,7 +197,7 @@ This YAML file defines:
   - training hyperparameters such as `epochs`, `batch_size`, `learning_rate`, and focal-loss settings
   - whether raw absolute keypoint coordinates are included in model input via `include_absolute_coordinates`
   - optional Gaussian noise injected into training windows via `keypoint_noise_std`, either globally or per behavior
-  - optional architecture selection via `training.model.variant` for either the original recurrent model or an opt-in convolutional front end
+  - optional architecture selection via `training.model.variant` for the original recurrent model, a convolutional front end, or a residual temporal convolutional network
   - optional final zero-fill parity cleanup via `final_zero_fill`
 
 Example:
@@ -234,7 +234,7 @@ training:
 ```
 
 Set `training.keypoint_noise_std` to either a single float or a per-behavior mapping to add Gaussian noise to keypoint inputs during training only. A value of `0.01` matches the always-on noise used in the older training codepath; validation and test windows remain noise-free.
-Set `training.model.variant: bilstm` to use the original recurrent-only model, or `training.model.variant: conv_bilstm` to add a lightweight `Conv1D` front end before the BiLSTM stack. For `conv_bilstm`, you can optionally provide `training.model.conv_frontend.filters` and `training.model.conv_frontend.kernel_sizes`; the defaults are `[32, 32]` and `[5, 3]`.
+Set `training.model.variant: bilstm` to use the original recurrent-only model, `training.model.variant: conv_bilstm` to add a lightweight `Conv1D` front end before the BiLSTM stack, or `training.model.variant: residual_tcn` to replace recurrence with a noncausal residual dilated temporal convolutional network. For `conv_bilstm`, you can optionally provide `training.model.conv_frontend.filters` and `training.model.conv_frontend.kernel_sizes`; the defaults are `[32, 32]` and `[5, 3]`.
 
 For behaviors that may depend on short local motion motifs, you can opt into a convolutional front end in the config:
 
@@ -246,6 +246,29 @@ training:
       filters: [32, 32]
       kernel_sizes: [5, 3]
 ```
+
+For framewise offline detection with a full-window temporal receptive field, use
+the residual TCN variant:
+
+```yaml
+training:
+  model:
+    variant: residual_tcn
+    residual_tcn:
+      channels: 64
+      kernel_size: 3
+      dilations: [1, 2, 4, 8]
+      convolutions_per_block: 2
+      dropout: 0.15
+      activation: relu
+```
+
+The input is first projected independently at each frame to `channels` learned
+representations. Each residual block then applies same-padded temporal
+convolutions at its configured dilation. With kernel size 3, two convolutions
+per block, and dilations `[1, 2, 4, 8]`, the theoretical receptive field is 61
+frames: `1 + (3 - 1) * 2 * (1 + 2 + 4 + 8)`. The convolutions are noncausal, so
+they use both preceding and following context just like the existing BiLSTM.
 
 Set `training.final_zero_fill: true` to apply one final `fillna(0)` pass after loading the per-video feature files and before windowing, which mirrors the old validation/training pipeline's last-stage NaN cleanup.
 
