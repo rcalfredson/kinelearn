@@ -16,6 +16,7 @@ from KineLearn.scripts.train import (
     checkpoint_thresholds,
     resolve_checkpoint_selection_config,
     resolve_execution_settings,
+    resolve_sampling_config,
     select_checkpoint_candidate,
 )
 
@@ -100,6 +101,45 @@ class ExecutionSettingsTests(unittest.TestCase):
             with self.subTest(name=name, value=value):
                 with self.assertRaisesRegex(ValueError, name):
                     resolve_execution_settings({name: value})
+
+
+class SamplingConfigTests(unittest.TestCase):
+    def test_uniform_sampling_is_the_default(self) -> None:
+        self.assertEqual(resolve_sampling_config({}, 8), {"strategy": "uniform"})
+
+    def test_hard_negative_batch_composition_is_normalized(self) -> None:
+        cfg = resolve_sampling_config(
+            {
+                "sampling": {
+                    "strategy": "hard_negative_stratified",
+                    "pool_path": "pool.csv",
+                    "positive_per_batch": 1,
+                    "hard_negative_per_batch": 3,
+                    "random_negative_per_batch": 4,
+                }
+            },
+            8,
+        )
+        self.assertEqual(cfg["strategy"], "hard_negative_stratified")
+        self.assertTrue(Path(cfg["pool_path"]).is_absolute())
+        self.assertEqual(cfg["positive_per_batch"], 1)
+        self.assertEqual(cfg["hard_negative_per_batch"], 3)
+        self.assertEqual(cfg["random_negative_per_batch"], 4)
+
+    def test_invalid_batch_composition_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sum to training.batch_size"):
+            resolve_sampling_config(
+                {
+                    "sampling": {
+                        "strategy": "hard_negative_stratified",
+                        "pool_path": "pool.csv",
+                        "positive_per_batch": 2,
+                        "hard_negative_per_batch": 3,
+                        "random_negative_per_batch": 4,
+                    }
+                },
+                8,
+            )
 
 
 class CheckpointCandidateRankingTests(unittest.TestCase):

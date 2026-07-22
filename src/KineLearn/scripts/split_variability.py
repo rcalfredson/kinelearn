@@ -139,6 +139,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional training.inference_batch_size override passed through to kinelearn-train.",
     )
     parser.add_argument(
+        "--hard-negative-pool",
+        default=None,
+        help=(
+            "Optional fixed hard-negative pool passed through to kinelearn-train. "
+            "A fixed pool is permitted only for a one-run sweep because it is "
+            "specific to one train/validation split."
+        ),
+    )
+    parser.add_argument(
         "--train-command",
         default="kinelearn-train",
         help="Training executable to invoke when --execute is set.",
@@ -289,6 +298,11 @@ def build_plan(
             if args.inference_batch_size is not None:
                 command.extend(
                     ["--inference-batch-size", str(args.inference_batch_size)]
+                )
+            hard_negative_pool = getattr(args, "hard_negative_pool", None)
+            if hard_negative_pool is not None:
+                command.extend(
+                    ["--hard-negative-pool", str(hard_negative_pool)]
                 )
 
             runs.append(
@@ -534,6 +548,14 @@ def validate_new_plan_args(args: argparse.Namespace) -> None:
             "The following arguments are required unless --resume is used: "
             + ", ".join(missing)
         )
+    if args.hard_negative_pool is not None:
+        n_outer = 1 if args.base_split else len(args.outer_seeds)
+        n_runs = n_outer * len(args.inner_seeds)
+        if n_runs != 1:
+            raise ValueError(
+                "--hard-negative-pool is specific to one train/validation split and "
+                "can only be used with a one-run sweep."
+            )
 
 
 def enrich_summary_row_from_manifest(
@@ -701,6 +723,11 @@ def main() -> None:
             "inference_batch_size": (
                 int(args.inference_batch_size)
                 if args.inference_batch_size is not None
+                else None
+            ),
+            "hard_negative_pool": (
+                str(Path(args.hard_negative_pool).resolve())
+                if args.hard_negative_pool is not None
                 else None
             ),
             "val_fraction": float(val_fraction),

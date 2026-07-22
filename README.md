@@ -89,7 +89,7 @@ You can install KineLearn either as a **user package** or in **editable (develop
 pip install .
 ```
 This installs KineLearn normally, adding the CLI commands  
-`kinelearn-calc`, `kinelearn-split`, `kinelearn-train`, `kinelearn-eval`, `kinelearn-predict`, `kinelearn-create-ensemble`, `kinelearn-select-ensemble`, `kinelearn-restore-run-artifacts`, `kinelearn-plot-timeline`, `kinelearn-split-variability`, `kinelearn-batch-eval-splits`, and `kinelearn-archive-results` to your PATH.
+`kinelearn-calc`, `kinelearn-split`, `kinelearn-train`, `kinelearn-eval`, `kinelearn-predict`, `kinelearn-create-ensemble`, `kinelearn-select-ensemble`, `kinelearn-restore-run-artifacts`, `kinelearn-plot-timeline`, `kinelearn-split-variability`, `kinelearn-batch-eval-splits`, `kinelearn-screen-hard-negatives`, and `kinelearn-archive-results` to your PATH.
 
 **B. Developer installation (for code modification):**
 ```bash
@@ -119,6 +119,7 @@ kinelearn-restore-run-artifacts --help
 kinelearn-plot-timeline --help
 kinelearn-split-variability --help
 kinelearn-batch-eval-splits --help
+kinelearn-screen-hard-negatives --help
 kinelearn-archive-results --help
 ```
 
@@ -504,7 +505,7 @@ It performs:
 1. **Loading and validating data** — reads feature and label `.parquet` files for each video.
 2. **Splitting into train/val/test** — uses the split file from `kinelearn-split`, applying the validation fraction defined in your config unless you provide an explicit validation split.
 3. **Windowing the data** — converts frame-level features and labels into overlapping windows stored as efficient `.memmap` arrays.
-4. **Building generators and model** — creates memmap-backed Keras generators and a keypoints-only BiLSTM model for the selected behavior.
+4. **Building generators and model** — creates memmap-backed Keras generators and the configured sequence model for the selected behavior.
 5. **Training with focal loss** — optimizes a per-timestep sigmoid classifier, checkpointing on `val_loss` by default or, when enabled, reconstructed validation episode F1.
 6. **Evaluating on test data** — reloads the best checkpointed weights and reports test metrics.
 7. **Recording outputs** — saves all artifacts into a run-specific directory under `results/<behavior>/<timestamp>/`, including a `train_manifest.yml` file summarizing dataset sizes, feature dimensions, training hyperparameters, artifact paths, and evaluation results.
@@ -542,6 +543,7 @@ Optional CLI overrides:
 - `--seed` to override `training.seed` for a specific run
 - `--focal-alpha` to override the focal-loss alpha for a specific training run
 - `--keypoint-noise-std` to override the training-time Gaussian noise std for a specific run
+- `--hard-negative-pool` to enable stratified training from a fixed pool produced by `kinelearn-screen-hard-negatives`
 - `--out-dir` to force the run into a specific output directory
 
 Training config note:
@@ -554,6 +556,68 @@ Training config note:
 - Use `--val-split` when you need a fixed, explicit train/validation partition. The resolved `split`, `val_split`, and train/val/test video stems are recorded in `train_manifest.yml` for traceability.
 - Use `--focal-alpha` when you want to tune alpha per split without changing the project-wide default in your config file; the resolved alpha used for that run is still recorded in the run manifest.
 - Use `--keypoint-noise-std` when you want to tune training-time noise per run without changing the project-wide default in your config file; the resolved noise value used for that run is still recorded in the run manifest.
+
+---
+### Mining hard-negative training windows
+
+The `kinelearn-screen-hard-negatives` command uses a completed training run to
+find fully label-negative training windows that nevertheless receive a sustained
+behavior probability. It never screens validation or test data.
+
+Hardness is the maximum contiguous rolling mean probability within a window.
+The rolling width defaults to the episode minimum used for checkpoint selection,
+so a single isolated high-probability frame does not outrank a sustained signal
+that could survive episode filtering. Selected windows are greedily separated
+within each video to avoid filling the pool with overlapping copies of one
+false-positive region.
+
+First screen a completed control run whose training memmaps are available:
+
+```bash
+kinelearn-screen-hard-negatives \
+  --manifest results/split_variability/blt_nested_static_relational/runs/outer_seed0/inner_seed0/train_manifest.yml \
+  --pool-fraction 0.10 \
+  --out-dir results/hard_negative_screens/blt_static_relational/outer_seed0/inner_seed0
+```
+
+The screen writes:
+
+- `hard_negative_scores.csv`, containing every fully negative candidate and its score
+- `hard_negative_pool.csv`, containing the selected overlap-diversified pool
+- `hard_negative_screen.yml`, recording the source manifest and weights hashes,
+  scoring settings, and candidate counts
+
+Then train a fresh model on the identical split with the stratified config and
+the fixed pool:
+
+```bash
+kinelearn-train \
+  --kl-config configs/drosophila_blt_static_relational_hard_negative.yaml \
+  --split results/split_variability/blt_nested_static_relational/splits/outer_seed0/train_test_split.yaml \
+  --val-split results/split_variability/blt_nested_static_relational/splits/outer_seed0/train_val_split_seed0.yaml \
+  --behavior back_leg_together \
+  --features-dir features \
+  --seed 0 \
+  --focal-alpha 0.64 \
+  --hard-negative-pool results/hard_negative_screens/blt_static_relational/outer_seed0/inner_seed0/hard_negative_pool.csv \
+  --out-dir results/split_variability/blt_static_relational_hard_negative_smoke/runs/outer_seed0/inner_seed0
+```
+
+The provided configuration constructs each batch of eight from one
+positive-containing window, three hard-negative windows, and four random
+negative windows. Training preserves the ordinary number of steps per epoch;
+validation and test generators remain exhaustive and unstratified. The training
+manifest records the resolved pool path and SHA-256 hash, source pool sizes,
+batch composition, and effective samples per epoch.
+
+Pools are identified by video stem and window start rather than source memmap
+row number. Training fails before fitting if pool windows are missing from the
+current training split or now contain positive labels. A fixed pool can also be
+passed through `kinelearn-split-variability --hard-negative-pool`, but only for
+a one-run sweep because each pool is specific to one inner train/validation
+split.
+
+### Throughput benchmark configuration
 
 For a staged throughput benchmark of the back-leg static-relational model, use
 the following explicitly named configs in order. They first isolate

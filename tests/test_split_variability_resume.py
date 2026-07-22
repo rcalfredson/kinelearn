@@ -76,6 +76,7 @@ class SplitVariabilityResumeTests(unittest.TestCase):
                 keypoint_noise_std=None,
                 steps_per_execution=32,
                 inference_batch_size=256,
+                hard_negative_pool="hard_negative_pool.csv",
             )
             original_split = split_variability_script.train_test_split
             split_variability_script.train_test_split = (
@@ -92,6 +93,10 @@ class SplitVariabilityResumeTests(unittest.TestCase):
             )
             self.assertEqual(
                 command[command.index("--inference-batch-size") + 1], "256"
+            )
+            self.assertEqual(
+                command[command.index("--hard-negative-pool") + 1],
+                "hard_negative_pool.csv",
             )
 
     def test_summary_metrics_are_rehydrated_from_completed_manifest(self) -> None:

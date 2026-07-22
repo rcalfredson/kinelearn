@@ -19,7 +19,9 @@ per behavior or overridden at the CLI for split-specific validation tuning.
 
 import argparse
 from datetime import datetime
+import hashlib
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -28,7 +30,8 @@ from sklearn.model_selection import train_test_split
 import yaml
 
 from KineLearn.core.features import select_behavior_feature_columns
-from KineLearn.core.generators import KeypointWindowGenerator
+from KineLearn.core.generators import KeypointWindowGenerator, StratifiedWindowGenerator
+from KineLearn.core.hard_negatives import match_hard_negative_pool
 from KineLearn.core.losses import focal_loss
 from KineLearn.core.memmap import make_windowed_memmaps
 from KineLearn.core.models import build_sequence_model
@@ -303,6 +306,56 @@ def resolve_execution_settings(training_cfg: Dict) -> tuple[int, int, int]:
         "inference_batch_size",
     )
     return batch_size, steps_per_execution, inference_batch_size
+
+
+def resolve_sampling_config(training_cfg: Dict, batch_size: int) -> dict[str, Any]:
+    """Validate and normalize the opt-in training-window sampling strategy."""
+    raw_cfg = training_cfg.get("sampling") or {}
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("training.sampling must be a mapping")
+    cfg = dict(raw_cfg)
+    strategy = str(cfg.get("strategy", "uniform")).strip().lower()
+    if strategy == "uniform":
+        return {"strategy": "uniform"}
+    if strategy != "hard_negative_stratified":
+        raise ValueError(f"Unknown training.sampling.strategy: {strategy}")
+
+    defaults = {
+        "positive_per_batch": 1,
+        "hard_negative_per_batch": 3,
+        "random_negative_per_batch": int(batch_size) - 4,
+    }
+    resolved = {"strategy": strategy}
+    for name, default in defaults.items():
+        value = cfg.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"training.sampling.{name} must be a nonnegative integer")
+        value = int(value)
+        if value < 0:
+            raise ValueError(f"training.sampling.{name} must be a nonnegative integer")
+        resolved[name] = value
+
+    count_sum = sum(resolved[name] for name in defaults)
+    if count_sum != int(batch_size):
+        raise ValueError(
+            "training.sampling per-batch counts must sum to training.batch_size; "
+            f"got {count_sum} for batch_size={batch_size}"
+        )
+    pool_path = cfg.get("pool_path")
+    if not pool_path:
+        raise ValueError(
+            "training.sampling.pool_path is required for hard_negative_stratified sampling"
+        )
+    resolved["pool_path"] = str(Path(pool_path).resolve())
+    return resolved
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def checkpoint_thresholds(selection_cfg: dict[str, Any]) -> list[float]:
@@ -744,6 +797,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--hard-negative-pool",
+        default=None,
+        help=(
+            "CSV pool from kinelearn-screen-hard-negatives. Providing this enables "
+            "hard_negative_stratified training and overrides training.sampling.pool_path."
+        ),
+    )
+    parser.add_argument(
         "--out-dir",
         default=None,
         help=(
@@ -785,6 +846,10 @@ def main():
         training_cfg["focal"]["alpha"] = float(args.focal_alpha)
     if args.keypoint_noise_std is not None:
         training_cfg["keypoint_noise_std"] = float(args.keypoint_noise_std)
+    if args.hard_negative_pool is not None:
+        training_cfg.setdefault("sampling", {})
+        training_cfg["sampling"]["strategy"] = "hard_negative_stratified"
+        training_cfg["sampling"]["pool_path"] = args.hard_negative_pool
 
     # Provide some sane defaults (used later when we add training)
     training_cfg.setdefault("epochs", 10)
@@ -814,6 +879,8 @@ def main():
     training_cfg["batch_size"] = batch_size
     training_cfg["steps_per_execution"] = steps_per_execution
     training_cfg["inference_batch_size"] = inference_batch_size
+    sampling_cfg = resolve_sampling_config(training_cfg, batch_size)
+    training_cfg["sampling"] = sampling_cfg
 
     # Resolve focal params (alpha can be global or per-behavior)
     alpha, gamma = resolve_focal_params(training_cfg, behavior)
@@ -837,6 +904,7 @@ def main():
         "keypoint_noise_std",
         "final_zero_fill",
         "checkpoint_selection",
+        "sampling",
     ]:
         print(f"  {k}: {training_cfg[k]}")
     if training_cfg.get("loss", "focal") == "focal":
@@ -1207,15 +1275,87 @@ def main():
     # ----------------------------
     # Generators (keypoints-only)
     # ----------------------------
-    train_gen = KeypointWindowGenerator(
-        mmX_tr,
-        mmY_tr,
-        behavior_idx=behavior_idx,
-        batch_size=batch_size,
-        shuffle=True,
-        seed=seed,
-        noise_std=noise_std,
-    )
+    train_labels_by_window = np.asarray(
+        mmY_tr[:, :, behavior_idx], dtype=np.uint8
+    ).sum(axis=1)
+    n_positive_windows = int(np.count_nonzero(train_labels_by_window > 0))
+    n_negative_windows = int(np.count_nonzero(train_labels_by_window == 0))
+    if sampling_cfg["strategy"] == "hard_negative_stratified":
+        pool_path = Path(sampling_cfg["pool_path"])
+        if not pool_path.exists():
+            raise FileNotFoundError(f"Hard-negative pool not found: {pool_path}")
+        hard_negative_indices = match_hard_negative_pool(
+            pool_path,
+            tr_vids,
+            tr_starts,
+            mmY_tr,
+            behavior_idx=behavior_idx,
+        )
+        pool_snapshot_path = out / "hard_negative_pool.csv"
+        if pool_path.resolve() != pool_snapshot_path.resolve():
+            shutil.copy2(pool_path, pool_snapshot_path)
+        source_screen_path = pool_path.parent / "hard_negative_screen.yml"
+        screen_snapshot_path = None
+        if source_screen_path.exists():
+            screen_snapshot_path = out / "hard_negative_source_screen.yml"
+            if source_screen_path.resolve() != screen_snapshot_path.resolve():
+                shutil.copy2(source_screen_path, screen_snapshot_path)
+        train_gen = StratifiedWindowGenerator(
+            mmX_tr,
+            mmY_tr,
+            behavior_idx=behavior_idx,
+            batch_size=batch_size,
+            hard_negative_indices=hard_negative_indices,
+            positive_per_batch=sampling_cfg["positive_per_batch"],
+            hard_negative_per_batch=sampling_cfg["hard_negative_per_batch"],
+            random_negative_per_batch=sampling_cfg["random_negative_per_batch"],
+            seed=seed,
+            noise_std=noise_std,
+        )
+        sampling_summary = {
+            **sampling_cfg,
+            "source_pool_path": str(pool_path.resolve()),
+            "pool_path": str(pool_snapshot_path.resolve()),
+            "pool_sha256": file_sha256(pool_snapshot_path),
+            "source_screen_metadata": (
+                str(screen_snapshot_path.resolve())
+                if screen_snapshot_path is not None
+                else None
+            ),
+            "n_positive_windows": n_positive_windows,
+            "n_negative_windows": n_negative_windows,
+            "n_hard_negative_windows": int(len(hard_negative_indices)),
+            "n_random_negative_windows": int(
+                n_negative_windows - len(hard_negative_indices)
+            ),
+            "steps_per_epoch": int(len(train_gen)),
+            "samples_per_epoch": int(len(train_gen) * batch_size),
+        }
+        print(
+            "Using hard-negative stratified sampling: "
+            f"{sampling_cfg['positive_per_batch']} positive, "
+            f"{sampling_cfg['hard_negative_per_batch']} hard negative, and "
+            f"{sampling_cfg['random_negative_per_batch']} random negative windows "
+            f"per batch ({len(hard_negative_indices)} hard windows in pool)."
+        )
+    else:
+        train_gen = KeypointWindowGenerator(
+            mmX_tr,
+            mmY_tr,
+            behavior_idx=behavior_idx,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed,
+            noise_std=noise_std,
+        )
+        sampling_summary = {
+            "strategy": "uniform",
+            "n_positive_windows": n_positive_windows,
+            "n_negative_windows": n_negative_windows,
+            "steps_per_epoch": int(len(train_gen)),
+            "samples_per_epoch": int(train_count),
+        }
+    manifest["sampling"] = sampling_summary
     val_gen = KeypointWindowGenerator(
         mmX_va,
         mmY_va,
